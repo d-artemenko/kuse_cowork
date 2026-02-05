@@ -1,39 +1,17 @@
-import { Component, createSignal, createEffect, For, Show, onCleanup } from "solid-js";
-import {
-  ClaudeCodeEvent,
-  ClaudeCodeRequest,
-  startClaudeCode,
-  respondClaudeCode,
-  cancelClaudeCode,
-} from "../lib/claude-code-api";
-import ClaudeCodePermissionDialog from "./ClaudeCodePermissionDialog";
-import ClaudeCodeAuthDialog from "./ClaudeCodeAuthDialog";
-import ClaudeCodeQuestionDialog from "./ClaudeCodeQuestionDialog";
+import { Component, createSignal, createEffect, onMount, onCleanup } from "solid-js";
+import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import "@xterm/xterm/css/xterm.css";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import "./ClaudeCodePanel.css";
 
-interface OutputLine {
-  id: number;
-  type: "text" | "tool" | "error";
-  content: string;
-  timestamp: Date;
-}
-
-interface PermissionRequest {
-  id: string;
-  tool: string;
-  description: string;
-}
-
-interface AuthRequest {
-  id: string;
-  service: string;
-  url?: string;
-}
-
-interface QuestionRequest {
-  id: string;
-  text: string;
-  options: string[];
+interface ClaudeCodeEvent {
+  type: string;
+  data?: string;
+  content?: string;
+  message?: string;
 }
 
 export interface ClaudeCodeTriggerData {
@@ -44,390 +22,276 @@ export interface ClaudeCodeTriggerData {
 
 interface Props {
   onClose?: () => void;
-  /** Initial configuration from Agent trigger */
   triggerData?: ClaudeCodeTriggerData | null;
-  /** Callback when session completes */
   onSessionComplete?: (result: string) => void;
+  onContinueWithAgent?: (result: string) => void | Promise<void>;
 }
 
 const ClaudeCodePanel: Component<Props> = (props) => {
-  const [prompt, setPrompt] = createSignal("");
-  const [workingDir, setWorkingDir] = createSignal("");
-  const [mcpServers, setMcpServers] = createSignal<string[]>([]);
-  const [output, setOutput] = createSignal<OutputLine[]>([]);
+  let terminalRef: HTMLDivElement | undefined;
+  let terminal: Terminal | undefined;
+  let fitAddon: FitAddon | undefined;
+  let unlistenFn: UnlistenFn | undefined;
+  let resizeObserver: ResizeObserver | undefined;
+
   const [isRunning, setIsRunning] = createSignal(false);
-  const [permissionRequest, setPermissionRequest] = createSignal<PermissionRequest | null>(null);
-  const [authRequest, setAuthRequest] = createSignal<AuthRequest | null>(null);
-  const [questionRequest, setQuestionRequest] = createSignal<QuestionRequest | null>(null);
-  const [error, setError] = createSignal<string | null>(null);
-  const [hasAutoStarted, setHasAutoStarted] = createSignal(false);
+  const [isReady, setIsReady] = createSignal(false);
+  const [lastTriggerPrompt, setLastTriggerPrompt] = createSignal<string | null>(null);
+  const [pendingPrompt, setPendingPrompt] = createSignal<string | null>(null);
+  const [claudeReady, setClaudeReady] = createSignal(false);
 
-  let outputRef: HTMLDivElement | undefined;
-  let unlistenFn: (() => void) | undefined;
+  const startSession = async (initialPrompt?: string) => {
+    if (isRunning()) return;
 
-  // Clean up previous listener before starting new session
-  const cleanupListener = () => {
-    if (unlistenFn) {
-      unlistenFn();
-      unlistenFn = undefined;
+    // Fit terminal first to get correct dimensions
+    if (fitAddon) {
+      fitAddon.fit();
     }
-  };
 
-  // Handle trigger data from Agent
-  createEffect(() => {
-    const data = props.triggerData;
-    if (data && !hasAutoStarted()) {
-      // Set initial values
-      setPrompt(data.prompt);
-      if (data.working_directory) {
-        setWorkingDir(data.working_directory);
-      }
-      if (data.mcp_servers && data.mcp_servers.length > 0) {
-        setMcpServers(data.mcp_servers);
-      }
-      // Auto-start the session
-      setHasAutoStarted(true);
-      setTimeout(() => {
-        startSession(data.prompt, data.working_directory, data.mcp_servers || []);
-      }, 100);
-    }
-  });
+    const rows = terminal?.rows || 24;
+    const cols = terminal?.cols || 80;
 
-  // Reset auto-start flag when trigger data is cleared
-  createEffect(() => {
-    if (!props.triggerData) {
-      setHasAutoStarted(false);
-    }
-  });
-
-  onCleanup(() => {
-    cleanupListener();
-  });
-
-  const scrollToBottom = () => {
-    if (outputRef) {
-      outputRef.scrollTop = outputRef.scrollHeight;
-    }
-  };
-
-  const addOutput = (type: OutputLine["type"], content: string) => {
-    setOutput((prev) => [
-      ...prev,
-      {
-        id: Date.now(),
-        type,
-        content,
-        timestamp: new Date(),
-      },
-    ]);
-    // Scroll after state update
-    setTimeout(scrollToBottom, 0);
-  };
-
-  // Collect output for session result
-  let sessionOutput: string[] = [];
-
-  const handleEvent = (event: ClaudeCodeEvent) => {
-    switch (event.type) {
-      case "output":
-        addOutput("text", event.content);
-        sessionOutput.push(event.content);
-        break;
-      case "tool_use":
-        addOutput("tool", `Using tool: ${event.tool}`);
-        break;
-      case "permission_request":
-        setPermissionRequest({
-          id: event.id,
-          tool: event.tool,
-          description: event.description,
-        });
-        break;
-      case "auth_required":
-        setAuthRequest({
-          id: event.id,
-          service: event.service,
-          url: event.url,
-        });
-        break;
-      case "question":
-        setQuestionRequest({
-          id: event.id,
-          text: event.text,
-          options: event.options,
-        });
-        break;
-      case "done":
-        setIsRunning(false);
-        setPermissionRequest(null);
-        setAuthRequest(null);
-        setQuestionRequest(null);
-        addOutput("text", "--- Session completed ---");
-        // Notify parent of completion
-        if (props.onSessionComplete) {
-          props.onSessionComplete(sessionOutput.join("\n"));
-        }
-        break;
-      case "error":
-        setIsRunning(false);
-        setQuestionRequest(null);
-        addOutput("error", event.message);
-        setError(event.message);
-        break;
-    }
-  };
-
-  const startSession = async (
-    promptText: string,
-    workingDirectory?: string,
-    servers?: string[]
-  ) => {
-    if (!promptText.trim()) return;
-
-    // Clean up any existing listener before starting new session
-    cleanupListener();
-
-    setError(null);
-    setOutput([]);
-    sessionOutput = [];
     setIsRunning(true);
+    terminal?.clear();
 
-    const request: ClaudeCodeRequest = {
-      prompt: promptText,
-      mcp_servers: servers || mcpServers(),
-      working_directory: workingDirectory || workingDir() || undefined,
-    };
+    // Set up event listener
+    unlistenFn = await listen<ClaudeCodeEvent>("claude-code-event", (e) => {
+      const event = e.payload;
+
+      if (event.type === "pty_data" && event.data && terminal) {
+        try {
+          const bytes = Uint8Array.from(atob(event.data), c => c.charCodeAt(0));
+          const text = new TextDecoder().decode(bytes);
+          terminal.write(text);
+
+          // Check if Claude is ready for input (look for the ">" prompt or input area)
+          // Claude Code shows "> " when ready for input
+          if (!claudeReady() && (text.includes("> ") || text.includes("❯") || text.includes("How can I help"))) {
+            console.log("[ClaudeCode] Claude ready for input detected");
+            setClaudeReady(true);
+
+            // Send pending prompt if any
+            const prompt = pendingPrompt();
+            if (prompt) {
+              console.log("[ClaudeCode] Sending pending prompt:", prompt.slice(0, 50));
+              setPendingPrompt(null);
+              // Small delay to ensure Claude is fully ready
+              setTimeout(() => {
+                writeToTerminal(prompt + "\n");
+              }, 100);
+            }
+          }
+        } catch (err) {
+          console.error("Failed to decode PTY data:", err);
+        }
+      } else if (event.type === "done") {
+        setIsRunning(false);
+        setClaudeReady(false);
+        terminal?.writeln("\r\n\x1b[90m--- Session ended. Press Enter to start a new session ---\x1b[0m");
+        props.onSessionComplete?.("");
+      } else if (event.type === "error") {
+        setIsRunning(false);
+        setClaudeReady(false);
+        terminal?.writeln(`\r\n\x1b[91mError: ${event.message}\x1b[0m`);
+      }
+    });
 
     try {
-      const { unlisten } = await startClaudeCode(request, handleEvent);
-      unlistenFn = unlisten;
-      addOutput("text", `> ${promptText}`);
+      // Start session with correct terminal dimensions
+      await invoke("start_claude_code", {
+        request: {
+          prompt: "",
+          mcp_servers: [],
+          working_directory: props.triggerData?.working_directory,
+          interactive: true,
+          rows,
+          cols,
+        }
+      });
+
+      // If there's an initial prompt, store it as pending
+      // It will be sent when Claude shows it's ready for input
+      if (initialPrompt) {
+        console.log("[ClaudeCode] Storing pending prompt:", initialPrompt.slice(0, 50));
+        setPendingPrompt(initialPrompt);
+      }
     } catch (e) {
       setIsRunning(false);
-      const errorMessage = e instanceof Error ? e.message : String(e);
-      setError(errorMessage);
-      addOutput("error", errorMessage);
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      terminal?.writeln(`\x1b[91mFailed to start: ${errorMsg}\x1b[0m`);
+      unlistenFn?.();
     }
   };
 
-  const handleSubmit = async (e: Event) => {
-    e.preventDefault();
-    await startSession(prompt().trim());
+  // Auto-start when triggerData is provided and terminal is ready
+  createEffect(() => {
+    const data = props.triggerData;
+    const ready = isReady();
+    const running = isRunning();
+    const lastPrompt = lastTriggerPrompt();
+
+    console.log("[ClaudeCode] Effect check:", {
+      hasData: !!data,
+      prompt: data?.prompt?.slice(0, 50),
+      ready,
+      running,
+      lastPrompt: lastPrompt?.slice(0, 50)
+    });
+
+    // Only auto-start if:
+    // 1. We have trigger data with a prompt
+    // 2. Terminal is ready
+    // 3. Not already running
+    // 4. This is a NEW prompt (different from the last one we processed)
+    if (data && data.prompt && ready && !running && data.prompt !== lastPrompt) {
+      console.log("[ClaudeCode] Auto-starting with prompt:", data.prompt.slice(0, 100));
+      setLastTriggerPrompt(data.prompt);
+      startSession(data.prompt);
+    }
+  });
+
+  const writeToTerminal = async (data: string) => {
+    if (!isRunning()) return;
+
+    try {
+      const bytes = new TextEncoder().encode(data);
+      const base64 = btoa(String.fromCharCode(...bytes));
+      await invoke("write_claude_code_pty", { data: base64 });
+    } catch (e) {
+      console.error("Failed to write to PTY:", e);
+    }
+  };
+
+  const handleResize = () => {
+    if (fitAddon && terminal) {
+      fitAddon.fit();
+      invoke("resize_claude_code_pty", {
+        rows: terminal.rows,
+        cols: terminal.cols,
+      }).catch(console.error);
+    }
   };
 
   const handleCancel = async () => {
     try {
-      await cancelClaudeCode();
+      await invoke("cancel_claude_code");
       setIsRunning(false);
-      setPermissionRequest(null);
-      setAuthRequest(null);
-      setQuestionRequest(null);
-      addOutput("text", "--- Session cancelled ---");
+      terminal?.writeln("\r\n\x1b[93m--- Session cancelled ---\x1b[0m");
     } catch (e) {
       console.error("Failed to cancel:", e);
     }
   };
 
-  const handlePermissionAllow = async () => {
-    const req = permissionRequest();
-    if (req) {
-      await respondClaudeCode({ type: "allow", id: req.id });
-      setPermissionRequest(null);
-    }
-  };
+  onMount(() => {
+    if (!terminalRef) return;
 
-  const handlePermissionDeny = async () => {
-    const req = permissionRequest();
-    if (req) {
-      await respondClaudeCode({ type: "deny", id: req.id });
-      setPermissionRequest(null);
-    }
-  };
-
-  const handleAuthComplete = async () => {
-    const req = authRequest();
-    if (req) {
-      await respondClaudeCode({ type: "auth_complete", id: req.id });
-      setAuthRequest(null);
-    }
-  };
-
-  const handleAuthCancel = async () => {
-    await handleCancel();
-    setAuthRequest(null);
-  };
-
-  const handleQuestionSubmit = async (answer: string) => {
-    const req = questionRequest();
-    if (req) {
-      await respondClaudeCode({ type: "input", id: req.id, text: answer });
-      setQuestionRequest(null);
-    }
-  };
-
-  const handleQuestionCancel = async () => {
-    await handleCancel();
-    setQuestionRequest(null);
-  };
-
-  const toggleMcpServer = (server: string) => {
-    setMcpServers((prev) => {
-      if (prev.includes(server)) {
-        return prev.filter((s) => s !== server);
-      }
-      return [...prev, server];
+    terminal = new Terminal({
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: '"SF Mono", "Menlo", "Monaco", "Cascadia Code", "Fira Code", monospace',
+      theme: {
+        background: "#0d1117",
+        foreground: "#c9d1d9",
+        cursor: "#f0f6fc",
+        cursorAccent: "#0d1117",
+        selectionBackground: "#3fb95040",
+        black: "#484f58",
+        red: "#ff7b72",
+        green: "#3fb950",
+        yellow: "#d29922",
+        blue: "#58a6ff",
+        magenta: "#bc8cff",
+        cyan: "#39c5cf",
+        white: "#b1bac4",
+        brightBlack: "#6e7681",
+        brightRed: "#ffa198",
+        brightGreen: "#56d364",
+        brightYellow: "#e3b341",
+        brightBlue: "#79c0ff",
+        brightMagenta: "#d2a8ff",
+        brightCyan: "#56d4dd",
+        brightWhite: "#f0f6fc",
+      },
+      allowProposedApi: true,
     });
-  };
 
-  const availableMcpServers = [
-    { id: "vercel", name: "Vercel", description: "Deploy and manage Vercel projects" },
-    { id: "flyio", name: "Fly.io", description: "Deploy and manage Fly.io apps" },
-    { id: "github", name: "GitHub", description: "Interact with GitHub repositories" },
-  ];
+    fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.loadAddon(new WebLinksAddon());
+
+    terminal.open(terminalRef);
+
+    // Initial fit after a short delay to ensure container is sized
+    setTimeout(() => {
+      fitAddon?.fit();
+    }, 50);
+
+    // Handle user input
+    terminal.onData((data) => {
+      if (!isRunning()) {
+        // If not running and user presses Enter, start session
+        if (data === "\r") {
+          startSession();
+        }
+      } else {
+        writeToTerminal(data);
+      }
+    });
+
+    // Watch for container resize
+    resizeObserver = new ResizeObserver(() => {
+      handleResize();
+    });
+    resizeObserver.observe(terminalRef);
+
+    // Welcome message (only if no trigger data)
+    if (!props.triggerData?.prompt) {
+      terminal.writeln("\x1b[1;36m╭─────────────────────────────────────────╮\x1b[0m");
+      terminal.writeln("\x1b[1;36m│\x1b[0m     \x1b[1mClaude Code Interactive Terminal\x1b[0m     \x1b[1;36m│\x1b[0m");
+      terminal.writeln("\x1b[1;36m╰─────────────────────────────────────────╯\x1b[0m");
+      terminal.writeln("");
+      terminal.writeln("\x1b[90mPress Enter to start a session...\x1b[0m");
+      terminal.writeln("");
+    }
+
+    // Mark as ready (triggers auto-start if triggerData exists)
+    setIsReady(true);
+  });
+
+  onCleanup(() => {
+    resizeObserver?.disconnect();
+    unlistenFn?.();
+    terminal?.dispose();
+
+    if (isRunning()) {
+      invoke("cancel_claude_code").catch(console.error);
+    }
+  });
 
   return (
     <div class="claude-code-panel">
       <div class="claude-code-header">
-        <h2 class="claude-code-title">Claude Code</h2>
-        <Show when={props.onClose}>
-          <button class="close-btn" onClick={props.onClose}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18" />
-              <line x1="6" y1="6" x2="18" y2="18" />
-            </svg>
-          </button>
-        </Show>
-      </div>
-
-      {/* Permission Dialog */}
-      <Show when={permissionRequest()}>
-        {(req) => (
-          <ClaudeCodePermissionDialog
-            id={req().id}
-            tool={req().tool}
-            description={req().description}
-            onAllow={handlePermissionAllow}
-            onDeny={handlePermissionDeny}
-          />
-        )}
-      </Show>
-
-      {/* Auth Dialog */}
-      <Show when={authRequest()}>
-        {(req) => (
-          <ClaudeCodeAuthDialog
-            id={req().id}
-            service={req().service}
-            url={req().url}
-            onComplete={handleAuthComplete}
-            onCancel={handleAuthCancel}
-          />
-        )}
-      </Show>
-
-      {/* Question Dialog */}
-      <Show when={questionRequest()}>
-        {(req) => (
-          <ClaudeCodeQuestionDialog
-            id={req().id}
-            text={req().text}
-            options={req().options}
-            onSubmit={handleQuestionSubmit}
-            onCancel={handleQuestionCancel}
-          />
-        )}
-      </Show>
-
-      {/* Output Area */}
-      <div class="claude-code-output" ref={outputRef}>
-        <Show
-          when={output().length > 0}
-          fallback={
-            <div class="output-placeholder">
-              <p>Enter a prompt to start a Claude Code session.</p>
-              <p class="hint">Claude Code will run with access to your local filesystem and any enabled MCP servers.</p>
-            </div>
-          }
-        >
-          <For each={output()}>
-            {(line) => (
-              <div class={`output-line ${line.type}`}>
-                <span class="output-content">{line.content}</span>
-              </div>
-            )}
-          </For>
-        </Show>
-      </div>
-
-      {/* MCP Server Selection */}
-      <div class="mcp-server-section">
-        <label class="section-label">MCP Servers</label>
-        <div class="mcp-server-list">
-          <For each={availableMcpServers}>
-            {(server) => (
-              <button
-                class={`mcp-server-chip ${mcpServers().includes(server.id) ? "active" : ""}`}
-                onClick={() => toggleMcpServer(server.id)}
-                disabled={isRunning()}
-                title={server.description}
-              >
-                {server.name}
-              </button>
-            )}
-          </For>
+        <div class="header-left">
+          <div class={`status-dot ${isRunning() ? "active" : "idle"}`} title={isRunning() ? "Session Active" : "Idle"} />
+          <h2 class="claude-code-title">Claude Code</h2>
         </div>
-      </div>
-
-      {/* Working Directory */}
-      <div class="working-dir-section">
-        <label class="section-label">Working Directory (optional)</label>
-        <input
-          type="text"
-          class="working-dir-input"
-          placeholder="/path/to/project"
-          value={workingDir()}
-          onInput={(e) => setWorkingDir(e.currentTarget.value)}
-          disabled={isRunning()}
-        />
-      </div>
-
-      {/* Input Form */}
-      <form class="claude-code-input-form" onSubmit={handleSubmit}>
-        <textarea
-          class="claude-code-input"
-          placeholder="Enter your prompt for Claude Code..."
-          value={prompt()}
-          onInput={(e) => setPrompt(e.currentTarget.value)}
-          disabled={isRunning()}
-          rows={3}
-        />
-        <div class="input-actions">
-          <Show when={isRunning()}>
-            <button
-              type="button"
-              class="cancel-btn"
-              onClick={handleCancel}
-            >
-              Cancel
+        <div class="header-actions">
+          {isRunning() && (
+            <button class="header-btn cancel" onClick={handleCancel} title="Stop Session">
+              <span class="btn-icon">⏹</span> Stop
             </button>
-          </Show>
-          <button
-            type="submit"
-            class="submit-btn"
-            disabled={isRunning() || !prompt().trim()}
-          >
-            {isRunning() ? "Running..." : "Run"}
-          </button>
+          )}
+          {props.onClose && (
+            <button class="header-btn close" onClick={props.onClose} title="Close Panel">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          )}
         </div>
-      </form>
-
-      {/* Error Display */}
-      <Show when={error()}>
-        <div class="error-banner">
-          <span>{error()}</span>
-          <button onClick={() => setError(null)}>Dismiss</button>
-        </div>
-      </Show>
+      </div>
+      <div class="claude-terminal" ref={terminalRef} />
     </div>
   );
 };

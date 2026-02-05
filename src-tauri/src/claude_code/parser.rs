@@ -110,6 +110,24 @@ impl OutputParser {
             || line.contains("press enter")
     }
 
+    /// Check if a line indicates the CLI is ready for input
+    pub fn is_ready_line(&self, line: &str) -> bool {
+        let line = line.trim();
+        if line.is_empty() {
+            return false;
+        }
+
+        if line.starts_with('❯') || line.starts_with('>') {
+            return true;
+        }
+
+        let lower = line.to_lowercase();
+        lower.contains("what would you like")
+            || lower.contains("enter your prompt")
+            || lower.contains("type /help")
+            || lower.contains("type /")
+    }
+
     /// Parse a line of output from Claude Code CLI
     pub fn parse_line(&self, line: &str) -> Option<ParsedOutput> {
         let line = line.trim();

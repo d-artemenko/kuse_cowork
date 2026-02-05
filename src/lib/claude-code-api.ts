@@ -6,10 +6,17 @@ export interface ClaudeCodeRequest {
   prompt: string;
   mcp_servers: string[];
   working_directory?: string;
+  /** Run in interactive terminal mode (true) or print mode (false) */
+  interactive?: boolean;
+  /** Terminal rows for interactive mode */
+  rows?: number;
+  /** Terminal columns for interactive mode */
+  cols?: number;
 }
 
 export type ClaudeCodeEvent =
   | { type: "output"; content: string }
+  | { type: "pty_data"; data: string }  // Base64 encoded raw PTY data
   | { type: "tool_use"; tool: string; input: unknown }
   | { type: "permission_request"; id: string; tool: string; description: string }
   | { type: "auth_required"; id: string; service: string; url?: string }
@@ -73,4 +80,19 @@ export async function cancelClaudeCode(): Promise<void> {
  */
 export async function getClaudeCodeStatus(): Promise<ClaudeCodeStatus> {
   return invoke("get_claude_code_status");
+}
+
+/**
+ * Write raw data to the Claude Code PTY (for terminal input)
+ * @param data Base64 encoded data to write
+ */
+export async function writeClaudeCodePty(data: string): Promise<void> {
+  return invoke("write_claude_code_pty", { data });
+}
+
+/**
+ * Resize the Claude Code PTY
+ */
+export async function resizeClaudeCodePty(rows: number, cols: number): Promise<void> {
+  return invoke("resize_claude_code_pty", { rows, cols });
 }

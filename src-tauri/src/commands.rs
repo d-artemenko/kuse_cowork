@@ -3035,3 +3035,33 @@ pub async fn get_claude_code_status(
 ) -> Result<ClaudeCodeStatus, CommandError> {
     Ok(state.claude_code_manager.get_status().await)
 }
+
+/// Write raw data to the Claude Code PTY (for terminal input)
+#[command]
+pub async fn write_claude_code_pty(
+    state: State<'_, Arc<AppState>>,
+    data: String,
+) -> Result<(), CommandError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(&data)
+        .map_err(|e| CommandError { message: format!("Invalid base64: {}", e) })?;
+    state
+        .claude_code_manager
+        .write_pty_raw(&bytes)
+        .await
+        .map_err(|e| CommandError { message: e })
+}
+
+/// Resize the Claude Code PTY
+#[command]
+pub async fn resize_claude_code_pty(
+    state: State<'_, Arc<AppState>>,
+    rows: u16,
+    cols: u16,
+) -> Result<(), CommandError> {
+    state
+        .claude_code_manager
+        .resize_pty(rows, cols)
+        .await
+        .map_err(|e| CommandError { message: e })
+}

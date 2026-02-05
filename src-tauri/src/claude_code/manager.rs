@@ -1,20 +1,18 @@
-use super::parser::{OutputParser, ParsedOutput};
 use super::types::{
     ClaudeCodeEvent, ClaudeCodeRequest, ClaudeCodeResponse, ClaudeCodeStatus, PendingPrompt,
     PendingPromptType,
 };
-use portable_pty::{native_pty_system, CommandBuilder, PtySize, Child};
+use portable_pty::{native_pty_system, CommandBuilder, Child, PtySize, MasterPty};
 use std::env;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter};
-use tempfile::{NamedTempFile, TempPath};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Get the path to the claude CLI binary
 fn get_claude_path() -> String {
-    // Check common installation locations on macOS
     let home = env::var("HOME").unwrap_or_default();
 
     let common_paths = [
@@ -22,25 +20,14 @@ fn get_claude_path() -> String {
         "/opt/homebrew/bin/claude",
         &format!("{}/.local/bin/claude", home),
         &format!("{}/.npm-global/bin/claude", home),
-        &format!("{}/.nvm/versions/node/*/bin/claude", home), // nvm installations
     ];
 
     for path in common_paths.iter() {
-        // Handle glob pattern for nvm
-        if path.contains('*') {
-            if let Ok(entries) = glob::glob(path) {
-                for entry in entries.flatten() {
-                    if entry.exists() {
-                        return entry.to_string_lossy().to_string();
-                    }
-                }
-            }
-        } else if std::path::Path::new(path).exists() {
+        if std::path::Path::new(path).exists() {
             return path.to_string();
         }
     }
 
-    // Fall back to just "claude" and hope it's in PATH
     "claude".to_string()
 }
 
@@ -49,80 +36,28 @@ fn get_extended_path() -> String {
     let current_path = env::var("PATH").unwrap_or_default();
     let home = env::var("HOME").unwrap_or_default();
 
-    let local_bin = format!("{}/.local/bin", home);
-    let npm_bin = format!("{}/.npm-global/bin", home);
-    let nvm_glob = format!("{}/.nvm/versions/node/*/bin", home);
-
-    let mut additional_paths = vec![
+    let additional_paths = vec![
         "/usr/local/bin".to_string(),
         "/opt/homebrew/bin".to_string(),
-        local_bin,
-        npm_bin,
+        format!("{}/.local/bin", home),
+        format!("{}/.npm-global/bin", home),
         "/usr/bin".to_string(),
         "/bin".to_string(),
     ];
 
-    if let Ok(entries) = glob::glob(&nvm_glob) {
-        for entry in entries.flatten() {
-            additional_paths.push(entry.to_string_lossy().to_string());
-        }
-    }
-
-    let mut all_paths: Vec<String> = additional_paths;
+    let mut all_paths = additional_paths;
     all_paths.push(current_path);
-
     all_paths.join(":")
 }
 
-/// Build MCP config JSON for the specified servers
-fn build_mcp_config_json(servers: &[String]) -> Option<String> {
-    if servers.is_empty() {
-        return None;
-    }
-
-    let mut mcp_servers = serde_json::Map::new();
-
-    for server in servers {
-        let (name, command, args) = match server.as_str() {
-            "vercel" => ("vercel", "npx", vec!["-y", "@vercel/mcp@latest"]),
-            "flyio" => ("flyio", "npx", vec!["-y", "@anthropic-ai/mcp-server-flyio"]),
-            "github" => (
-                "github",
-                "npx",
-                vec!["-y", "@modelcontextprotocol/server-github"],
-            ),
-            _ => {
-                eprintln!("Unknown MCP server: {}", server);
-                continue;
-            }
-        };
-
-        let server_config = serde_json::json!({
-            "command": command,
-            "args": args
-        });
-        mcp_servers.insert(name.to_string(), server_config);
-    }
-
-    if mcp_servers.is_empty() {
-        return None;
-    }
-
-    let config = serde_json::json!({
-        "mcpServers": mcp_servers
-    });
-
-    Some(config.to_string())
-}
-
-/// Manager for Claude Code CLI PTY sessions
+/// Manager for Claude Code CLI PTY sessions (interactive mode)
 pub struct ClaudeCodeManager {
     status: Arc<RwLock<ClaudeCodeStatus>>,
     pending_prompts: Arc<RwLock<Vec<PendingPrompt>>>,
     pty_writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    pty_master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     child_process: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
     cancel_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    mcp_config_path: Arc<Mutex<Option<TempPath>>>,
 }
 
 impl ClaudeCodeManager {
@@ -131,9 +66,9 @@ impl ClaudeCodeManager {
             status: Arc::new(RwLock::new(ClaudeCodeStatus::Idle)),
             pending_prompts: Arc::new(RwLock::new(Vec::new())),
             pty_writer: Arc::new(Mutex::new(None)),
+            pty_master: Arc::new(Mutex::new(None)),
             child_process: Arc::new(Mutex::new(None)),
             cancel_tx: Arc::new(Mutex::new(None)),
-            mcp_config_path: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -151,58 +86,45 @@ impl ClaudeCodeManager {
             }
         }
 
-        // Create PTY for interactive session
+        // Create PTY for interactive session with size from request
         let pty_system = native_pty_system();
+        eprintln!("[ClaudeCode] Creating PTY with size: {}x{}", request.cols, request.rows);
         let pair = pty_system
             .openpty(PtySize {
-                rows: 50,
-                cols: 200,
+                rows: request.rows,
+                cols: request.cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
-        // Build claude command - interactive mode (no --print flag)
+        // Build claude command
         let claude_path = get_claude_path();
         eprintln!("[ClaudeCode] Using claude path: {}", claude_path);
+        eprintln!("[ClaudeCode] Interactive mode: {}", request.interactive);
 
         let mut cmd = CommandBuilder::new(&claude_path);
 
-        // Set extended PATH
-        cmd.env("PATH", get_extended_path());
+        if request.interactive {
+            // Interactive mode - full terminal experience
+            // Don't use -p flag, run claude normally for interactive use
+            cmd.env("TERM", "xterm-256color");
+        } else {
+            // Print mode with streaming JSON for programmatic usage
+            cmd.arg("-p");  // Print mode (non-interactive)
+            cmd.arg("--output-format");
+            cmd.arg("stream-json");  // Streaming JSON output
+            cmd.arg("--verbose");  // Show full turn-by-turn output
+            cmd.env("NO_COLOR", "1");
+            cmd.env("TERM", "xterm-256color");
 
-        // Set terminal type - xterm-256color works well with most CLIs
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-
-        // Collect all arguments
-        let mut args: Vec<String> = Vec::new();
-
-        // Prefer non-TUI output while keeping PTY for input prompts
-        args.push("--print".to_string());
-
-        // Add MCP config if servers specified (write to temp file for CLI compatibility)
-        if let Some(mcp_config) = build_mcp_config_json(&request.mcp_servers) {
-            let mut file = NamedTempFile::new()
-                .map_err(|e| format!("Failed to create MCP temp file: {}", e))?;
-            file.write_all(mcp_config.as_bytes())
-                .map_err(|e| format!("Failed to write MCP config: {}", e))?;
-            let temp_path = file.into_temp_path();
-            let path_str = temp_path.to_string_lossy().to_string();
-            {
-                let mut guard = self.mcp_config_path.lock().await;
-                *guard = Some(temp_path);
+            // Add the prompt as the last argument in print mode
+            if !request.prompt.trim().is_empty() {
+                cmd.arg(&request.prompt);
             }
-            args.push("--mcp-config".to_string());
-            args.push(path_str);
         }
 
-        eprintln!("[ClaudeCode] Command args: {:?}", args);
-
-        // Add all arguments
-        for arg in &args {
-            cmd.arg(arg);
-        }
+        cmd.env("PATH", get_extended_path());
 
         // Set working directory
         if let Some(ref dir) = request.working_directory {
@@ -210,13 +132,13 @@ impl ClaudeCodeManager {
             cmd.cwd(dir);
         }
 
-        // Spawn the process in the PTY
+        // Spawn the process
         let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
-        // Get reader and writer from master
+        // Get reader and writer
         let reader = pair
             .master
             .try_clone_reader()
@@ -227,10 +149,14 @@ impl ClaudeCodeManager {
             .take_writer()
             .map_err(|e| format!("Failed to take writer: {}", e))?;
 
-        // Store writer for sending responses to prompts
+        // Store writer and master for resize
         {
             let mut pty_writer_guard = self.pty_writer.lock().await;
             *pty_writer_guard = Some(writer);
+        }
+        {
+            let mut pty_master_guard = self.pty_master.lock().await;
+            *pty_master_guard = Some(pair.master);
         }
 
         // Store child process
@@ -254,122 +180,170 @@ impl ClaudeCodeManager {
 
         let session_id = Uuid::new_v4().to_string();
 
-        // Spawn reader task
+        let last_output = Arc::new(StdMutex::new(Instant::now()));
+
+        // Clone for reader thread
         let status_clone = self.status.clone();
         let pending_prompts_clone = self.pending_prompts.clone();
         let app_handle_clone = app_handle.clone();
-        let mcp_config_path_clone = self.mcp_config_path.clone();
+        let last_output_clone = last_output.clone();
+        let is_interactive = request.interactive;
 
+        // Spawn reader thread
         std::thread::spawn(move || {
-            eprintln!("[ClaudeCode] Reader thread started");
-            let parser = OutputParser::new();
+            eprintln!("[ClaudeCode] Reader thread started (interactive={})", is_interactive);
             let mut reader = reader;
-            let mut buffer = [0u8; 4096];
+            let mut buffer = [0u8; 8192];
             let mut line_buffer = String::new();
 
             loop {
-                // Check for cancellation (non-blocking)
                 if cancel_rx.try_recv().is_ok() {
                     eprintln!("[ClaudeCode] Cancellation received");
                     break;
                 }
 
-                // Read from PTY
                 match reader.read(&mut buffer) {
                     Ok(0) => {
-                        // EOF - process ended
                         eprintln!("[ClaudeCode] EOF - process ended");
+                        if !is_interactive && !line_buffer.trim().is_empty() {
+                            Self::process_json_line(&line_buffer, &app_handle_clone, &status_clone, &pending_prompts_clone);
+                        }
                         break;
                     }
                     Ok(n) => {
-                        // Convert bytes to string and strip ANSI escapes
-                        let chunk = String::from_utf8_lossy(&buffer[..n]);
-                        let preview: String = chunk.chars().take(200).collect();
-                        eprintln!("[ClaudeCode] Read {} bytes: {:?}", n, preview);
-                        let clean_chunk = strip_ansi_escapes::strip_str(&chunk);
-
-                        // Add to line buffer
-                        line_buffer.push_str(&clean_chunk);
-
-                        // Process complete lines
-                        while let Some(newline_pos) = line_buffer.find('\n') {
-                            let line = line_buffer[..newline_pos].to_string();
-                            line_buffer = line_buffer[newline_pos + 1..].to_string();
-
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-
-                            // Parse the line
-                            if let Some(parsed) = parser.parse_line(trimmed) {
-                                let event = Self::parsed_to_event(
-                                    parsed,
-                                    &status_clone,
-                                    &pending_prompts_clone,
-                                );
-
-                                // Emit event to frontend
-                                eprintln!("[ClaudeCode] Emitting event: {:?}", &event);
-                                if let Err(e) = app_handle_clone.emit("claude-code-event", &event) {
-                                    eprintln!("[ClaudeCode] Failed to emit event: {}", e);
-                                }
-                            }
+                        if let Ok(mut guard) = last_output_clone.lock() {
+                            *guard = Instant::now();
                         }
 
-                        // Also check for prompts in partial line (prompts may not end with newline)
-                        if !line_buffer.is_empty() {
-                            let trimmed = line_buffer.trim();
-                            if parser.is_prompt(trimmed) {
-                                if let Some(parsed) = parser.parse_line(trimmed) {
-                                    let event = Self::parsed_to_event(
-                                        parsed,
-                                        &status_clone,
-                                        &pending_prompts_clone,
-                                    );
-                                    let _ = app_handle_clone.emit("claude-code-event", &event);
-                                    line_buffer.clear();
+                        if is_interactive {
+                            // Interactive mode: emit raw PTY data for terminal rendering
+                            use base64::{Engine as _, engine::general_purpose::STANDARD};
+                            let encoded = STANDARD.encode(&buffer[..n]);
+                            let _ = app_handle_clone.emit("claude-code-event", &ClaudeCodeEvent::PtyData {
+                                data: encoded,
+                            });
+                        } else {
+                            // Print mode: parse streaming JSON
+                            let chunk = String::from_utf8_lossy(&buffer[..n]);
+                            line_buffer.push_str(&chunk);
+
+                            // Process complete lines (newline-delimited JSON)
+                            while let Some(newline_pos) = line_buffer.find('\n') {
+                                let line = line_buffer[..newline_pos].to_string();
+                                line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
                                 }
+
+                                Self::process_json_line(trimmed, &app_handle_clone, &status_clone, &pending_prompts_clone);
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error reading PTY: {}", e);
+                        eprintln!("[ClaudeCode] Read error: {}", e);
                         break;
                     }
                 }
             }
 
-            // Session ended - update status
+            // Session ended
             if let Ok(mut status) = status_clone.try_write() {
                 if *status == ClaudeCodeStatus::Running {
                     *status = ClaudeCodeStatus::Completed;
                     let _ = app_handle_clone.emit("claude-code-event", &ClaudeCodeEvent::Done);
                 }
             }
-
-            // Drop temp MCP config file
-            if let Ok(mut guard) = mcp_config_path_clone.try_write() {
-                *guard = None;
-            }
         });
+
+        // In print mode, the prompt is passed as argument, no need to send via PTY
+        let _ = app_handle.emit(
+            "claude-code-event",
+            &ClaudeCodeEvent::Output {
+                content: format!("→ Started Claude Code with prompt: {}", request.prompt),
+            },
+        );
+
+        eprintln!("[ClaudeCode] Session started");
 
         Ok(session_id)
     }
 
-    /// Convert ParsedOutput to ClaudeCodeEvent, updating state for prompts
-    fn parsed_to_event(
-        parsed: ParsedOutput,
+    /// Process a line of streaming JSON output from Claude Code
+    fn process_json_line(
+        line: &str,
+        app_handle: &AppHandle,
         status: &Arc<RwLock<ClaudeCodeStatus>>,
         pending_prompts: &Arc<RwLock<Vec<PendingPrompt>>>,
-    ) -> ClaudeCodeEvent {
-        match parsed {
-            ParsedOutput::Text(content) => ClaudeCodeEvent::Output { content },
-            ParsedOutput::ToolUse { name, input } => {
-                ClaudeCodeEvent::ToolUse { tool: name, input }
+    ) {
+        // Try to parse as JSON
+        let json: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                // Not valid JSON, emit as plain text
+                eprintln!("[ClaudeCode] Non-JSON output: {}", &line[..line.len().min(100)]);
+                let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Output {
+                    content: line.to_string(),
+                });
+                return;
             }
-            ParsedOutput::PermissionRequest { tool, description } => {
+        };
+
+        eprintln!("[ClaudeCode] JSON event: {}", json.get("type").and_then(|t| t.as_str()).unwrap_or("unknown"));
+
+        // Handle different event types from stream-json format
+        let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            "assistant" => {
+                // Assistant message with content
+                if let Some(message) = json.get("message") {
+                    if let Some(content) = message.get("content") {
+                        if let Some(arr) = content.as_array() {
+                            for block in arr {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Output {
+                                        content: text.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "content_block_delta" => {
+                // Streaming text delta
+                if let Some(delta) = json.get("delta") {
+                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                        let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Output {
+                            content: text.to_string(),
+                        });
+                    }
+                }
+            }
+            "tool_use" => {
+                // Tool being used
+                let tool_name = json.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+                let input = json.get("input").cloned().unwrap_or(serde_json::Value::Null);
+                let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::ToolUse {
+                    tool: tool_name,
+                    input,
+                });
+            }
+            "tool_result" => {
+                // Tool result
+                if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
+                    let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Output {
+                        content: format!("Tool result: {}", content),
+                    });
+                }
+            }
+            "user_input_request" => {
+                // Permission or input request
                 let id = Uuid::new_v4().to_string();
+                let tool = json.get("tool").and_then(|t| t.as_str()).unwrap_or("unknown").to_string();
+                let description = json.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
 
                 let pending = PendingPrompt {
                     id: id.clone(),
@@ -390,72 +364,40 @@ impl ClaudeCodeManager {
                     };
                 }
 
-                ClaudeCodeEvent::PermissionRequest { id, tool, description }
+                let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::PermissionRequest {
+                    id,
+                    tool,
+                    description,
+                });
             }
-            ParsedOutput::AuthRequired { service, url } => {
-                let id = Uuid::new_v4().to_string();
-
-                let pending = PendingPrompt {
-                    id: id.clone(),
-                    prompt_type: PendingPromptType::Auth {
-                        service: service.clone(),
-                        url: url.clone(),
-                    },
-                    created_at: std::time::Instant::now(),
-                };
-
-                if let Ok(mut prompts) = pending_prompts.try_write() {
-                    prompts.push(pending);
-                }
-
-                if let Ok(mut s) = status.try_write() {
-                    *s = ClaudeCodeStatus::WaitingForInput {
-                        request_id: id.clone(),
-                    };
-                }
-
-                ClaudeCodeEvent::AuthRequired { id, service, url }
-            }
-            ParsedOutput::Question { text, options } => {
-                let id = Uuid::new_v4().to_string();
-
-                let pending = PendingPrompt {
-                    id: id.clone(),
-                    prompt_type: PendingPromptType::Question {
-                        text: text.clone(),
-                        options: options.clone(),
-                    },
-                    created_at: std::time::Instant::now(),
-                };
-
-                if let Ok(mut prompts) = pending_prompts.try_write() {
-                    prompts.push(pending);
-                }
-
-                if let Ok(mut s) = status.try_write() {
-                    *s = ClaudeCodeStatus::WaitingForInput {
-                        request_id: id.clone(),
-                    };
-                }
-
-                ClaudeCodeEvent::Question { id, text, options }
-            }
-            ParsedOutput::Done => {
-                if let Ok(mut s) = status.try_write() {
-                    *s = ClaudeCodeStatus::Completed;
-                }
-                ClaudeCodeEvent::Done
-            }
-            ParsedOutput::Error(message) => {
+            "error" => {
+                let message = json.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error").to_string();
                 if let Ok(mut s) = status.try_write() {
                     *s = ClaudeCodeStatus::Error;
                 }
-                ClaudeCodeEvent::Error { message }
+                let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Error { message });
+            }
+            "result" => {
+                // Final result
+                if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+                    let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Output {
+                        content: result.to_string(),
+                    });
+                }
+                if let Ok(mut s) = status.try_write() {
+                    *s = ClaudeCodeStatus::Completed;
+                }
+                let _ = app_handle.emit("claude-code-event", &ClaudeCodeEvent::Done);
+            }
+            _ => {
+                // Unknown event type, log it
+                eprintln!("[ClaudeCode] Unknown event type: {}", event_type);
             }
         }
     }
 
-    /// Respond to a pending prompt by writing to PTY stdin
+    /// Respond to a pending prompt
     pub async fn respond(&self, response: ClaudeCodeResponse) -> Result<(), String> {
         match response {
             ClaudeCodeResponse::Allow { id } => {
@@ -471,7 +413,6 @@ impl ClaudeCodeManager {
                 self.update_status_to_running().await;
             }
             ClaudeCodeResponse::AuthComplete { id } => {
-                // For auth, user completed in browser, send Enter to continue
                 self.write_to_pty("\n").await?;
                 self.remove_pending_prompt(&id).await;
                 self.update_status_to_running().await;
@@ -488,29 +429,63 @@ impl ClaudeCodeManager {
         Ok(())
     }
 
-    /// Write input to the PTY
+    /// Write to PTY (internal)
     async fn write_to_pty(&self, input: &str) -> Result<(), String> {
         let mut writer_guard = self.pty_writer.lock().await;
         if let Some(ref mut writer) = *writer_guard {
             writer
                 .write_all(input.as_bytes())
-                .map_err(|e| format!("Failed to write to PTY: {}", e))?;
+                .map_err(|e| format!("Failed to write: {}", e))?;
             writer
                 .flush()
-                .map_err(|e| format!("Failed to flush PTY: {}", e))?;
+                .map_err(|e| format!("Failed to flush: {}", e))?;
             Ok(())
         } else {
             Err("No active PTY session".to_string())
         }
     }
 
-    /// Find pending prompt by id
+    /// Write raw bytes to PTY (for terminal input)
+    pub async fn write_pty_raw(&self, data: &[u8]) -> Result<(), String> {
+        let mut writer_guard = self.pty_writer.lock().await;
+        if let Some(ref mut writer) = *writer_guard {
+            writer
+                .write_all(data)
+                .map_err(|e| format!("Failed to write: {}", e))?;
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush: {}", e))?;
+            Ok(())
+        } else {
+            Err("No active PTY session".to_string())
+        }
+    }
+
+    /// Resize the PTY
+    pub async fn resize_pty(&self, rows: u16, cols: u16) -> Result<(), String> {
+        let master_guard = self.pty_master.lock().await;
+        if let Some(ref master) = *master_guard {
+            eprintln!("[ClaudeCode] Resizing PTY to {}x{}", cols, rows);
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| format!("Failed to resize PTY: {}", e))?;
+            Ok(())
+        } else {
+            // No active session, just ignore
+            Ok(())
+        }
+    }
+
     async fn find_pending_prompt(&self, id: &str) -> Option<PendingPrompt> {
         let prompts = self.pending_prompts.read().await;
         prompts.iter().find(|p| p.id == id).cloned()
     }
 
-    /// Choose a permission reply based on the original prompt text
     async fn permission_reply(&self, id: &str, allow: bool) -> String {
         let prompt = self.find_pending_prompt(id).await;
 
@@ -529,7 +504,6 @@ impl ClaudeCodeManager {
         }
     }
 
-    /// Select reply token for common permission prompt formats
     fn select_permission_reply(description: &str, allow: bool) -> String {
         let desc = description.to_lowercase();
         let token = if desc.contains("allow/deny") || desc.contains("[allow/deny]") {
@@ -545,13 +519,11 @@ impl ClaudeCodeManager {
         format!("{}\n", token)
     }
 
-    /// Remove a pending prompt by ID
     async fn remove_pending_prompt(&self, id: &str) {
         let mut prompts = self.pending_prompts.write().await;
         prompts.retain(|p| p.id != id);
     }
 
-    /// Update status back to running after responding
     async fn update_status_to_running(&self) {
         let mut status = self.status.write().await;
         if matches!(*status, ClaudeCodeStatus::WaitingForInput { .. }) {
@@ -561,35 +533,33 @@ impl ClaudeCodeManager {
 
     /// Cancel the current session
     pub async fn cancel(&self) -> Result<(), String> {
-        // Send Ctrl+C to the PTY
-        if let Err(e) = self.write_to_pty("\x03").await {
-            eprintln!("Failed to send Ctrl+C: {}", e);
-        }
+        // Send Ctrl+C
+        let _ = self.write_to_pty("\x03").await;
 
-        // Send cancel signal to reader thread
+        // Signal cancellation
         if let Some(tx) = self.cancel_tx.lock().await.take() {
             let _ = tx.send(()).await;
         }
 
-        // Kill the child process
+        // Kill child process
         if let Some(mut child) = self.child_process.lock().await.take() {
             let _ = child.kill();
         }
 
-        // Clear PTY writer
+        // Clear writer and master
         {
             let mut writer = self.pty_writer.lock().await;
             *writer = None;
+        }
+        {
+            let mut master = self.pty_master.lock().await;
+            *master = None;
         }
 
         // Clear state
         {
             let mut prompts = self.pending_prompts.write().await;
             prompts.clear();
-        }
-        {
-            let mut path = self.mcp_config_path.lock().await;
-            *path = None;
         }
         {
             let mut status = self.status.write().await;
@@ -599,7 +569,7 @@ impl ClaudeCodeManager {
         Ok(())
     }
 
-    /// Get the current status
+    /// Get current status
     pub async fn get_status(&self) -> ClaudeCodeStatus {
         self.status.read().await.clone()
     }

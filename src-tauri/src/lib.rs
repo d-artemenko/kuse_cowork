@@ -188,6 +188,8 @@ pub fn run() {
             commands::respond_claude_code,
             commands::cancel_claude_code,
             commands::get_claude_code_status,
+            commands::write_claude_code_pty,
+            commands::resize_claude_code_pty,
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]

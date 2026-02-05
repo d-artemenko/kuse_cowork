@@ -433,6 +433,19 @@ const App: Component = () => {
     }
   };
 
+  const handleClaudeContinue = async (result: string) => {
+    if (activeTask()) {
+      await handleContinueTask(result, activeTask()?.project_path || undefined);
+    } else {
+      const firstLine = result.split("\n")[0] || "Claude Code Result";
+      const title = `${firstLine.slice(0, 30)}...`;
+      await handleNewTask(title, result);
+    }
+
+    setShowClaudeCode(false);
+    setClaudeCodeTrigger(null);
+  };
+
   // Clear active task to start a new one
   const handleNewConversation = () => {
     setActiveTask(null);
@@ -539,6 +552,7 @@ const App: Component = () => {
                     // Clear trigger after completion
                     setClaudeCodeTrigger(null);
                   }}
+                  onContinueWithAgent={handleClaudeContinue}
                 />
               </Show>
               <Show when={!showSettings() && !showSkills() && !showMCP() && !showDocEditor() && !showDataPanels() && !showVideoPanel() && !showClaudeCode()}>

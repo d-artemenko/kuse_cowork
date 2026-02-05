@@ -8,6 +8,9 @@ pub enum ClaudeCodeEvent {
     /// Regular text output from Claude Code
     Output { content: String },
 
+    /// Raw PTY data for terminal rendering (base64 encoded)
+    PtyData { data: String },
+
     /// Tool use notification
     ToolUse { tool: String, input: Value },
 
@@ -48,7 +51,19 @@ pub struct ClaudeCodeRequest {
     pub mcp_servers: Vec<String>,
     /// Working directory for the session
     pub working_directory: Option<String>,
+    /// Run in interactive terminal mode (true) or print mode (false)
+    #[serde(default)]
+    pub interactive: bool,
+    /// Terminal rows (for interactive mode)
+    #[serde(default = "default_rows")]
+    pub rows: u16,
+    /// Terminal columns (for interactive mode)
+    #[serde(default = "default_cols")]
+    pub cols: u16,
 }
+
+fn default_rows() -> u16 { 24 }
+fn default_cols() -> u16 { 80 }
 
 /// Response to a Claude Code prompt/permission request
 #[derive(Clone, Debug, Serialize, Deserialize)]
