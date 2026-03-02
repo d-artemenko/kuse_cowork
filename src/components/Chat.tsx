@@ -1,7 +1,13 @@
 import { Component, For, Show, createSignal } from "solid-js";
 import { useChat } from "../stores/chat";
 import { useSettings } from "../stores/settings";
-import { sendChatMessage, sendChatWithTools, ChatEvent, isTauri } from "../lib/tauri-api";
+import {
+  sendChatMessage,
+  sendChatWithTools,
+  sendChatMessageViaMoltis,
+  ChatEvent,
+  isTauri,
+} from "../lib/tauri-api";
 import "./Chat.css";
 
 interface ToolExecution {
@@ -25,13 +31,14 @@ const Chat: Component = () => {
     isLoading,
     setIsLoading,
   } = useChat();
-  const { isConfigured, toggleSettings } = useSettings();
+  const { settings, isConfigured, toggleSettings } = useSettings();
 
   const [input, setInput] = createSignal("");
   const [enableTools, setEnableTools] = createSignal(true);
   const [projectPath, setProjectPath] = createSignal("");
   const [toolExecutions, setToolExecutions] = createSignal<ToolExecution[]>([]);
   const [showProjectInput, setShowProjectInput] = createSignal(false);
+  const [useMoltisGateway, setUseMoltisGateway] = createSignal(false);
   let messagesEnd: HTMLDivElement | undefined;
 
   const scrollToBottom = () => {
@@ -109,8 +116,13 @@ const Chat: Component = () => {
     scrollToBottom();
 
     try {
-      // Use enhanced chat with tools if enabled and in Tauri
-      if (enableTools() && isTauri()) {
+      // Route to Moltis gateway when enabled.
+      if (isTauri() && useMoltisGateway()) {
+        const fullText = await sendChatMessageViaMoltis(convId, text);
+        updateLastMessage(fullText);
+        scrollToBottom();
+      } else if (enableTools() && isTauri()) {
+        // Use enhanced chat with tools if enabled and in Tauri
         await sendChatWithTools(
           {
             conversation_id: convId,
@@ -218,9 +230,24 @@ const Chat: Component = () => {
                   type="checkbox"
                   checked={enableTools()}
                   onChange={(e) => setEnableTools(e.currentTarget.checked)}
-                  disabled={isLoading()}
+                  disabled={isLoading() || useMoltisGateway()}
                 />
                 <span class="toggle-text">Tools</span>
+              </label>
+              <label class="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={useMoltisGateway()}
+                  onChange={(e) => {
+                    const enabled = e.currentTarget.checked;
+                    setUseMoltisGateway(enabled);
+                    if (enabled) {
+                      setEnableTools(false);
+                    }
+                  }}
+                  disabled={isLoading() || !settings().moltisServerUrl.trim()}
+                />
+                <span class="toggle-text">Use Moltis</span>
               </label>
               <Show when={enableTools()}>
                 <button
