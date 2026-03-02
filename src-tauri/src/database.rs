@@ -36,6 +36,15 @@ pub struct Settings {
     /// Optional OpenAI Project ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_project: Option<String>,
+    /// Moltis gateway base URL (server or local sidecar)
+    #[serde(default)]
+    pub moltis_server_url: String,
+    /// Optional API key for Moltis gateway auth
+    #[serde(default)]
+    pub moltis_api_key: String,
+    /// Enables local sidecar mode in desktop routing
+    #[serde(default)]
+    pub moltis_sidecar_enabled: bool,
 }
 
 impl Default for Settings {
@@ -50,6 +59,9 @@ impl Default for Settings {
             provider_keys: HashMap::new(),
             openai_organization: None,
             openai_project: None,
+            moltis_server_url: "http://127.0.0.1:13131".to_string(),
+            moltis_api_key: String::new(),
+            moltis_sidecar_enabled: false,
         }
     }
 }
@@ -283,6 +295,11 @@ impl Database {
                         settings.provider_keys = keys;
                     }
                 }
+                "moltis_server_url" => settings.moltis_server_url = value,
+                "moltis_api_key" => settings.moltis_api_key = value,
+                "moltis_sidecar_enabled" => {
+                    settings.moltis_sidecar_enabled = matches!(value.as_str(), "true" | "1" | "yes" | "on");
+                }
                 _ => {}
             }
         }
@@ -324,6 +341,16 @@ impl Database {
             ("temperature", settings.temperature.to_string()),
             ("provider", provider),
             ("provider_keys", provider_keys_json),
+            ("moltis_server_url", settings.moltis_server_url.clone()),
+            ("moltis_api_key", settings.moltis_api_key.clone()),
+            (
+                "moltis_sidecar_enabled",
+                if settings.moltis_sidecar_enabled {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                },
+            ),
         ];
 
         for (key, value) in pairs {

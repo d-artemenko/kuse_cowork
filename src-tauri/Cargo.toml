@@ -28,6 +28,8 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
+tokio-tungstenite = "0.24"
+url = "2"
 
 # SQLite for local storage
 rusqlite = { version = "0.32", features = ["bundled"] }

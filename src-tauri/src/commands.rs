@@ -2,9 +2,11 @@ use crate::agent::{AgentConfig, AgentContent, AgentEvent, AgentLoop, AgentMessag
 use crate::claude::{ClaudeClient, Message as ClaudeMessage};
 use crate::database::{Conversation, Database, Message, PlanStep, Settings, Task, TaskMessage};
 use crate::mcp::{MCPManager, MCPServerConfig, MCPServerStatus, MCPToolCall, MCPToolResult};
+use crate::moltis_client::{MoltisClient, MoltisClientConfig, MoltisClientError};
 use crate::skills::{SkillMetadata, get_available_skills};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{command, Emitter, State, Window};
 use tokio::sync::Mutex;
 
@@ -33,6 +35,30 @@ impl From<crate::claude::ClaudeError> for CommandError {
             message: e.to_string(),
         }
     }
+}
+
+impl From<MoltisClientError> for CommandError {
+    fn from(e: MoltisClientError) -> Self {
+        CommandError {
+            message: e.to_string(),
+        }
+    }
+}
+
+fn build_moltis_client(settings: &Settings) -> Result<MoltisClient, CommandError> {
+    if settings.moltis_server_url.trim().is_empty() {
+        return Err(CommandError {
+            message: "Moltis server URL not configured".to_string(),
+        });
+    }
+    let api_key = if settings.moltis_api_key.trim().is_empty() {
+        None
+    } else {
+        Some(settings.moltis_api_key.clone())
+    };
+    let mut cfg = MoltisClientConfig::new(settings.moltis_server_url.clone(), api_key);
+    cfg.timeout = Duration::from_secs(45);
+    Ok(MoltisClient::new(cfg))
 }
 
 // Platform command
@@ -211,6 +237,91 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>) -> Result<String, 
             }
         }
     }
+}
+
+#[command]
+pub async fn test_moltis_connection(state: State<'_, Arc<AppState>>) -> Result<String, CommandError> {
+    let settings = state.db.get_settings()?;
+    let client = build_moltis_client(&settings)?;
+
+    let health = client.health().await?;
+    let hello = client.check_ws_connection().await?;
+    let version = health
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let protocol = hello
+        .get("protocol")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    Ok(format!("success (version={version}, protocol={protocol})"))
+}
+
+#[command]
+pub async fn moltis_health(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, CommandError> {
+    let settings = state.db.get_settings()?;
+    let client = build_moltis_client(&settings)?;
+    client.health().await.map_err(Into::into)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoltisCallRequest {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[command]
+pub async fn moltis_call(
+    state: State<'_, Arc<AppState>>,
+    request: MoltisCallRequest,
+) -> Result<serde_json::Value, CommandError> {
+    if request.method.trim().is_empty() {
+        return Err(CommandError {
+            message: "Method name is required".to_string(),
+        });
+    }
+    let settings = state.db.get_settings()?;
+    let client = build_moltis_client(&settings)?;
+    client.call(&request.method, request.params).await.map_err(Into::into)
+}
+
+#[command]
+pub async fn send_chat_message_via_moltis(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    content: String,
+) -> Result<String, CommandError> {
+    let settings = state.db.get_settings()?;
+    let client = build_moltis_client(&settings)?;
+
+    // Persist user message locally before dispatching to Moltis.
+    let existing_messages = state.db.get_messages(&conversation_id)?;
+    let user_msg_id = uuid::Uuid::new_v4().to_string();
+    state
+        .db
+        .add_message(&user_msg_id, &conversation_id, "user", &content)?;
+
+    let session_key = format!("kuse:{}", conversation_id);
+    let reply = client
+        .chat_send_and_wait(&session_key, &content, Some(&settings.model))
+        .await?;
+
+    let assistant_msg_id = uuid::Uuid::new_v4().to_string();
+    state
+        .db
+        .add_message(&assistant_msg_id, &conversation_id, "assistant", &reply.text)?;
+
+    if existing_messages.len() <= 1 {
+        let title = if content.len() > 30 {
+            format!("{}...", &content[..30])
+        } else {
+            content.clone()
+        };
+        state.db.update_conversation_title(&conversation_id, &title)?;
+    }
+
+    Ok(reply.text)
 }
 
 // Conversation commands

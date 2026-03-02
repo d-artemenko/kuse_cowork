@@ -4,6 +4,7 @@ mod commands;
 mod database;
 mod llm_client;
 mod mcp;
+mod moltis_client;
 mod skills;
 mod tools;
 
@@ -42,6 +43,10 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::test_connection,
+            commands::test_moltis_connection,
+            commands::moltis_health,
+            commands::moltis_call,
+            commands::send_chat_message_via_moltis,
             commands::list_conversations,
             commands::create_conversation,
             commands::update_conversation_title,
