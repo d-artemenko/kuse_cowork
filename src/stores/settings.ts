@@ -14,6 +14,9 @@ export interface Settings {
   providerKeys: Record<string, string>;  // Provider-specific API keys
   openaiOrganization?: string;  // Optional OpenAI Organization ID
   openaiProject?: string;  // Optional OpenAI Project ID
+  moltisServerUrl: string;
+  moltisApiKey: string;
+  moltisSidecarEnabled: boolean;
 }
 
 // Provider configuration type
@@ -224,6 +227,9 @@ const DEFAULT_SETTINGS: Settings = {
   maxTokens: 4096,
   temperature: 0.7,
   providerKeys: {},
+  moltisServerUrl: "http://127.0.0.1:13131",
+  moltisApiKey: "",
+  moltisSidecarEnabled: false,
 };
 
 // Get provider ID from model
@@ -262,6 +268,9 @@ function fromApiSettings(api: ApiSettings): Settings {
     providerKeys,
     openaiOrganization: api.openai_organization,
     openaiProject: api.openai_project,
+    moltisServerUrl: api.moltis_server_url || "http://127.0.0.1:13131",
+    moltisApiKey: api.moltis_api_key || "",
+    moltisSidecarEnabled: api.moltis_sidecar_enabled ?? false,
   };
 }
 
@@ -282,6 +291,9 @@ function toApiSettings(settings: Settings): ApiSettings {
     provider_keys: providerKeys,
     openai_organization: settings.openaiOrganization,
     openai_project: settings.openaiProject,
+    moltis_server_url: settings.moltisServerUrl,
+    moltis_api_key: settings.moltisApiKey,
+    moltis_sidecar_enabled: settings.moltisSidecarEnabled,
   };
 }
 

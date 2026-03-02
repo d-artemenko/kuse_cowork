@@ -1,6 +1,6 @@
 import { Component, createSignal, createMemo, Show } from "solid-js";
 import { useSettings, AVAILABLE_MODELS, PROVIDER_PRESETS, getProviderFromModel } from "../stores/settings";
-import { testConnection } from "../lib/tauri-api";
+import { testConnection, testMoltisConnection } from "../lib/tauri-api";
 import ModelSelector from "./ModelSelector";
 import "./Settings.css";
 
@@ -8,6 +8,8 @@ const Settings: Component = () => {
   const { settings, updateSetting, toggleSettings } = useSettings();
   const [testing, setTesting] = createSignal(false);
   const [testResult, setTestResult] = createSignal<string | null>(null);
+  const [testingMoltis, setTestingMoltis] = createSignal(false);
+  const [moltisTestResult, setMoltisTestResult] = createSignal<string | null>(null);
 
 
   // Get current selected model's provider info
@@ -61,6 +63,20 @@ const Settings: Component = () => {
       setTestResult(`Error: ${errorMsg}`);
     }
     setTesting(false);
+  };
+
+  const handleMoltisTest = async () => {
+    setTestingMoltis(true);
+    setMoltisTestResult(null);
+    try {
+      const result = await testMoltisConnection();
+      setMoltisTestResult(result);
+    } catch (e) {
+      const errorMsg = e instanceof Error ? e.message : String(e);
+      setMoltisTestResult(`Error: ${errorMsg}`);
+    } finally {
+      setTestingMoltis(false);
+    }
   };
 
   // const handleSave = async () => {
@@ -235,6 +251,71 @@ const Settings: Component = () => {
             <br />
             API key is securely stored and never sent to any server except Anthropic's API.
           </p>
+        </div>
+
+        <div class="settings-section">
+          <h3>Moltis Integration</h3>
+
+          <div class="form-group">
+            <label for="moltisServerUrl">Moltis Server URL</label>
+            <input
+              id="moltisServerUrl"
+              type="text"
+              value={settings().moltisServerUrl}
+              onInput={(e) => updateSetting("moltisServerUrl", e.currentTarget.value)}
+              placeholder="http://127.0.0.1:13131"
+            />
+            <span class="hint">
+              Gateway URL used for `/health` and `/ws/chat` RPC.
+            </span>
+          </div>
+
+          <div class="form-group">
+            <label for="moltisApiKey">
+              Moltis API Key
+              <span class="optional-tag">(Optional)</span>
+            </label>
+            <input
+              id="moltisApiKey"
+              type="password"
+              value={settings().moltisApiKey}
+              onInput={(e) => updateSetting("moltisApiKey", e.currentTarget.value)}
+              placeholder="moltis-api-key"
+            />
+            <span class="hint">
+              Leave empty if Moltis auth is disabled for your environment.
+            </span>
+          </div>
+
+          <div class="form-group">
+            <label class="toggle-label">
+              <input
+                type="checkbox"
+                checked={settings().moltisSidecarEnabled}
+                onChange={(e) => updateSetting("moltisSidecarEnabled", e.currentTarget.checked)}
+              />
+              <span class="toggle-text">Enable local Moltis sidecar mode</span>
+            </label>
+            <span class="hint">
+              Routing policy hook for future local sidecar execution.
+            </span>
+          </div>
+
+          <div class="form-group">
+            <button
+              class="test-btn"
+              onClick={handleMoltisTest}
+              disabled={testingMoltis() || !settings().moltisServerUrl.trim()}
+            >
+              {testingMoltis() ? "Testing Moltis..." : "Test Moltis Connection"}
+            </button>
+            {moltisTestResult() && !moltisTestResult()!.startsWith("Error:") && (
+              <span class="test-success">✓ {moltisTestResult()}</span>
+            )}
+            {moltisTestResult() && moltisTestResult()!.startsWith("Error:") && (
+              <span class="test-error">{moltisTestResult()}</span>
+            )}
+          </div>
         </div>
       </div>
     </div>

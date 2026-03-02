@@ -12,6 +12,9 @@ export interface Settings {
   provider_keys: Record<string, string>;  // Provider-specific API keys
   openai_organization?: string;  // Optional OpenAI Organization ID
   openai_project?: string;  // Optional OpenAI Project ID
+  moltis_server_url: string;
+  moltis_api_key: string;
+  moltis_sidecar_enabled: boolean;
 }
 
 export interface Conversation {
@@ -131,6 +134,9 @@ export async function getSettings(): Promise<Settings> {
         max_tokens: parsed.maxTokens || 4096,
         temperature: parsed.temperature ?? 0.7,
         provider_keys: parsed.providerKeys || {},
+        moltis_server_url: parsed.moltisServerUrl || "http://127.0.0.1:13131",
+        moltis_api_key: parsed.moltisApiKey || "",
+        moltis_sidecar_enabled: parsed.moltisSidecarEnabled ?? false,
       };
     }
     return {
@@ -140,6 +146,9 @@ export async function getSettings(): Promise<Settings> {
       max_tokens: 4096,
       temperature: 0.7,
       provider_keys: {},
+      moltis_server_url: "http://127.0.0.1:13131",
+      moltis_api_key: "",
+      moltis_sidecar_enabled: false,
     };
   }
   return invoke<Settings>("get_settings");
@@ -156,6 +165,9 @@ export async function saveSettings(settings: Settings): Promise<void> {
         maxTokens: settings.max_tokens,
         temperature: settings.temperature,
         providerKeys: settings.provider_keys,
+        moltisServerUrl: settings.moltis_server_url,
+        moltisApiKey: settings.moltis_api_key,
+        moltisSidecarEnabled: settings.moltis_sidecar_enabled,
       })
     );
     return;
@@ -186,6 +198,13 @@ export async function testConnection(): Promise<string> {
   const result = await invoke<string>("test_connection");
   console.log("Tauri invoke result:", result);
   return result;
+}
+
+export async function testMoltisConnection(): Promise<string> {
+  if (!isTauri()) {
+    return "Moltis test is available only in Tauri mode";
+  }
+  return invoke<string>("test_moltis_connection");
 }
 
 // Conversations API
@@ -333,6 +352,19 @@ export async function sendChatMessage(
       unlisten();
     }
   }
+}
+
+export async function sendChatMessageViaMoltis(
+  conversationId: string,
+  content: string
+): Promise<string> {
+  if (!isTauri()) {
+    throw new Error("Moltis chat is available only in Tauri mode");
+  }
+  return invoke<string>("send_chat_message_via_moltis", {
+    conversationId,
+    content,
+  });
 }
 
 // Agent API
