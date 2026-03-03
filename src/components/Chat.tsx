@@ -1,7 +1,7 @@
 import { Component, For, Show, createSignal } from "solid-js";
 import { useChat } from "../stores/chat";
 import { useSettings } from "../stores/settings";
-import { sendChatMessageViaMoltis, isTauri } from "../lib/tauri-api";
+import { sendChatMessageViaMoltis, isTauri, reportUiRuntimeError } from "../lib/tauri-api";
 import "./Chat.css";
 
 const Chat: Component = () => {
@@ -60,6 +60,10 @@ const Chat: Component = () => {
       } else if (typeof error === "string") {
         errorMsg = error;
       }
+      void reportUiRuntimeError({
+        source: "chat.send",
+        message: errorMsg,
+      });
       updateLastMessage(`Error: ${errorMsg}`);
     } finally {
       setIsLoading(false);

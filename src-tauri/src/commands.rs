@@ -1,6 +1,8 @@
 use crate::agent::AgentEvent;
 use crate::claude::ClaudeClient;
-use crate::database::{Conversation, Database, Message, Settings, Task, TaskMessage};
+use crate::database::{
+    Conversation, Database, Message, Settings, Task, TaskMessage, UiRuntimeError,
+};
 use crate::mcp::{MCPManager, MCPServerConfig, MCPServerStatus, MCPToolCall, MCPToolResult};
 use crate::moltis_client::{MoltisClient, MoltisClientConfig, MoltisClientError};
 use crate::skills::{get_available_skills, SkillMetadata};
@@ -67,19 +69,13 @@ fn moltis_model_override(settings: &Settings) -> Option<String> {
         return None;
     }
 
-    // If a Moltis-style model id is already provided, pass it through.
+    // In Moltis-only mode, only explicit Moltis model ids should be forwarded.
+    // Legacy provider-local ids are hidden in UI and should not affect runtime routing.
     if raw_model.contains("::") {
         return Some(raw_model.to_string());
     }
 
-    // Kuse model ids are typically provider-less (e.g. "gpt-5", "claude-sonnet-...").
-    // Moltis expects "provider::model" (or "openrouter::provider/model").
-    let provider = settings.get_provider();
-    match provider.as_str() {
-        "anthropic" | "openai" | "google" | "minimax" => Some(format!("{provider}::{raw_model}")),
-        "openrouter" => Some(format!("openrouter::{raw_model}")),
-        _ => Some(raw_model.to_string()),
-    }
+    None
 }
 
 fn is_moltis_model_not_found_error(message: &str) -> bool {
@@ -208,6 +204,45 @@ pub async fn send_chat_message_via_moltis(
     send_chat_message_via_moltis_with_db(&state.db, &settings, &conversation_id, &content).await
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UiRuntimeErrorReport {
+    pub source: String,
+    pub message: String,
+    pub stack: Option<String>,
+    pub context: Option<String>,
+}
+
+#[command]
+pub fn report_ui_runtime_error(
+    state: State<'_, Arc<AppState>>,
+    report: UiRuntimeErrorReport,
+) -> Result<(), CommandError> {
+    store_ui_runtime_error(
+        &state.db,
+        &report.source,
+        &report.message,
+        report.stack.as_deref(),
+        report.context.as_deref(),
+    )
+}
+
+#[command]
+pub fn list_ui_runtime_errors(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<u32>,
+) -> Result<Vec<UiRuntimeError>, CommandError> {
+    let bounded = limit.unwrap_or(100).clamp(1, 500);
+    state
+        .db
+        .list_ui_runtime_errors(bounded as usize)
+        .map_err(Into::into)
+}
+
+#[command]
+pub fn clear_ui_runtime_errors(state: State<'_, Arc<AppState>>) -> Result<(), CommandError> {
+    state.db.clear_ui_runtime_errors().map_err(Into::into)
+}
+
 async fn test_moltis_connection_with_settings(settings: &Settings) -> Result<String, CommandError> {
     let status = moltis_connection_status_with_settings(settings).await;
     if !status.ok {
@@ -320,6 +355,47 @@ fn format_moltis_error(err: &MoltisClientError) -> String {
         }
         other => other.to_string(),
     }
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
+}
+
+fn store_ui_runtime_error(
+    db: &Database,
+    source: &str,
+    message: &str,
+    stack: Option<&str>,
+    context: Option<&str>,
+) -> Result<(), CommandError> {
+    let source = source.trim();
+    let message = message.trim();
+    if source.is_empty() {
+        return Err(CommandError {
+            message: "UI runtime error source is required".to_string(),
+        });
+    }
+    if message.is_empty() {
+        return Err(CommandError {
+            message: "UI runtime error message is required".to_string(),
+        });
+    }
+    let source = truncate_for_log(source, 128);
+    let message = truncate_for_log(message, 2000);
+    let stack = stack
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| truncate_for_log(v, 8000));
+    let context = context
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| truncate_for_log(v, 4000));
+
+    db.add_ui_runtime_error(&source, &message, stack.as_deref(), context.as_deref())?;
+    Ok(())
 }
 
 async fn moltis_health_with_settings(
@@ -1081,30 +1157,18 @@ mod tests {
     }
 
     #[test]
-    fn moltis_model_override_handles_provider_mapping_and_passthrough() {
-        let openai = settings_with_model("gpt-5", "openai");
-        assert_eq!(
-            moltis_model_override(&openai).as_deref(),
-            Some("openai::gpt-5")
-        );
-
-        let openrouter = settings_with_model("anthropic/claude-sonnet-4", "openrouter");
-        assert_eq!(
-            moltis_model_override(&openrouter).as_deref(),
-            Some("openrouter::anthropic/claude-sonnet-4")
-        );
-
+    fn moltis_model_override_uses_only_explicit_moltis_ids() {
         let already_prefixed = settings_with_model("google::gemini-2.5-pro", "google");
         assert_eq!(
             moltis_model_override(&already_prefixed).as_deref(),
             Some("google::gemini-2.5-pro")
         );
 
-        let unknown = settings_with_model("custom-model", "custom");
-        assert_eq!(
-            moltis_model_override(&unknown).as_deref(),
-            Some("custom-model")
-        );
+        let legacy_openai = settings_with_model("gpt-5", "openai");
+        assert_eq!(moltis_model_override(&legacy_openai), None);
+
+        let legacy_openrouter = settings_with_model("anthropic/claude-sonnet-4", "openrouter");
+        assert_eq!(moltis_model_override(&legacy_openrouter), None);
 
         let empty = settings_with_model("   ", "anthropic");
         assert_eq!(moltis_model_override(&empty), None);
@@ -1117,6 +1181,30 @@ mod tests {
         ));
         assert!(is_moltis_model_not_found_error("UNKNOWN MODEL id"));
         assert!(!is_moltis_model_not_found_error("rate limit exceeded"));
+    }
+
+    #[test]
+    fn store_ui_runtime_error_validates_required_fields_and_truncates() {
+        let db = Database::new_in_memory_for_tests().unwrap();
+
+        let err = store_ui_runtime_error(&db, "   ", "x", None, None).unwrap_err();
+        assert!(err.message.contains("source is required"));
+
+        let err = store_ui_runtime_error(&db, "window.error", "   ", None, None).unwrap_err();
+        assert!(err.message.contains("message is required"));
+
+        let long_message = "a".repeat(2500);
+        store_ui_runtime_error(
+            &db,
+            "window.error",
+            &long_message,
+            Some("stack"),
+            Some("context"),
+        )
+        .unwrap();
+        let entries = db.list_ui_runtime_errors(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message.len(), 2000);
     }
 
     async fn ws_read_json(
@@ -1589,7 +1677,7 @@ mod tests {
         let db = Database::new_in_memory_for_tests().unwrap();
         db.create_conversation("conv-1", "tmp").unwrap();
 
-        let mut settings = settings_with_model("gpt-5", "openai");
+        let mut settings = settings_with_model("openai::gpt-5", "openai");
         settings.moltis_server_url = format!("ws://{addr}");
         settings.moltis_api_key = "bridge-key".to_string();
 
@@ -1616,5 +1704,63 @@ mod tests {
             .find(|c| c.id == "conv-1")
             .unwrap();
         assert_eq!(conversation.title, "This is a fairly long user mes...");
+    }
+
+    #[tokio::test]
+    async fn send_task_message_via_moltis_ignores_legacy_hidden_model_setting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut socket = ws_accept_and_handshake_with_auth(&listener, Some("bridge-key")).await;
+            let req = ws_read_json(&mut socket).await;
+            let req_id = req
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                req.get("method").and_then(serde_json::Value::as_str),
+                Some("chat.send")
+            );
+            assert!(
+                req.get("params").and_then(|v| v.get("model")).is_none(),
+                "legacy hidden model must not be sent to Moltis"
+            );
+
+            ws_send_json(
+                &mut socket,
+                serde_json::json!({
+                    "type":"res",
+                    "id": req_id,
+                    "ok": true,
+                    "payload": {"runId":"run-legacy"}
+                }),
+            )
+            .await;
+            ws_send_json(
+                &mut socket,
+                serde_json::json!({
+                    "type":"event",
+                    "event":"chat",
+                    "payload":{
+                        "runId":"run-legacy",
+                        "sessionKey":"kuse-task:task-1",
+                        "state":"final",
+                        "text":"Task OK"
+                    }
+                }),
+            )
+            .await;
+            let _ = socket.close(None).await;
+        });
+
+        let mut settings = settings_with_model("claude-sonnet-4-5-20250929", "anthropic");
+        settings.moltis_server_url = format!("ws://{addr}");
+        settings.moltis_api_key = "bridge-key".to_string();
+
+        let text = send_task_message_via_moltis(&settings, "task-1", "ping")
+            .await
+            .unwrap();
+        assert_eq!(text, "Task OK");
     }
 }

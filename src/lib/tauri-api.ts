@@ -26,6 +26,22 @@ export interface MoltisConnectionStatus {
   error?: string;
 }
 
+export interface UiRuntimeErrorReport {
+  source: string;
+  message: string;
+  stack?: string;
+  context?: string;
+}
+
+export interface UiRuntimeErrorRecord {
+  id: string;
+  source: string;
+  message: string;
+  stack?: string;
+  context?: string;
+  timestamp: number;
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -203,6 +219,31 @@ export async function getMoltisConnectionStatus(): Promise<MoltisConnectionStatu
     throw new Error("Moltis status is available only in Tauri mode");
   }
   return invoke<MoltisConnectionStatus>("get_moltis_connection_status");
+}
+
+export async function reportUiRuntimeError(report: UiRuntimeErrorReport): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+  try {
+    await invoke("report_ui_runtime_error", { report });
+  } catch (error) {
+    console.warn("Failed to report UI runtime error:", error);
+  }
+}
+
+export async function listUiRuntimeErrors(limit = 100): Promise<UiRuntimeErrorRecord[]> {
+  if (!isTauri()) {
+    return [];
+  }
+  return invoke<UiRuntimeErrorRecord[]>("list_ui_runtime_errors", { limit });
+}
+
+export async function clearUiRuntimeErrors(): Promise<void> {
+  if (!isTauri()) {
+    return;
+  }
+  return invoke("clear_ui_runtime_errors");
 }
 
 // Conversations API

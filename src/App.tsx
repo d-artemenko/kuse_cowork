@@ -1,6 +1,6 @@
 import { Component, Show, createSignal, onMount } from "solid-js";
 import { useSettings, loadSettings } from "./stores/settings";
-import { Task, TaskMessage, AgentEvent, listTasks, createTask, deleteTask, runTaskAgent, getTask, getTaskMessages } from "./lib/tauri-api";
+import { Task, TaskMessage, AgentEvent, listTasks, createTask, deleteTask, runTaskAgent, getTask, getTaskMessages, reportUiRuntimeError } from "./lib/tauri-api";
 import AgentMain from "./components/AgentMain";
 import Settings from "./components/Settings";
 import SkillsList from "./components/SkillsList";
@@ -104,6 +104,11 @@ const App: Component = () => {
       );
     } catch (err) {
       console.error("Task error:", err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      void reportUiRuntimeError({
+        source: "task.run.new",
+        message: errorMessage,
+      });
     } finally {
       setIsRunning(false);
       // Refresh task to get final state
@@ -233,6 +238,11 @@ const App: Component = () => {
       );
     } catch (err) {
       console.error("Task error:", err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      void reportUiRuntimeError({
+        source: "task.run.continue",
+        message: errorMessage,
+      });
     } finally {
       setIsRunning(false);
       // Refresh task to get final state

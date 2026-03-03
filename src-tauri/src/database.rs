@@ -177,6 +177,16 @@ pub struct TaskMessage {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiRuntimeError {
+    pub id: String,
+    pub source: String,
+    pub message: String,
+    pub stack: Option<String>,
+    pub context: Option<String>,
+    pub timestamp: i64,
+}
+
 pub struct Database {
     pub(crate) conn: Mutex<Connection>,
 }
@@ -287,6 +297,24 @@ impl Database {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_task_messages_task
              ON task_messages(task_id)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ui_runtime_errors (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                message TEXT NOT NULL,
+                stack TEXT,
+                context TEXT,
+                timestamp INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ui_runtime_errors_timestamp
+             ON ui_runtime_errors(timestamp DESC)",
             [],
         )?;
 
@@ -754,6 +782,66 @@ impl Database {
 
         Ok(())
     }
+
+    pub fn add_ui_runtime_error(
+        &self,
+        source: &str,
+        message: &str,
+        stack: Option<&str>,
+        context: Option<&str>,
+    ) -> Result<UiRuntimeError, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        conn.execute(
+            "INSERT INTO ui_runtime_errors (id, source, message, stack, context, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, source, message, stack, context, now],
+        )?;
+
+        Ok(UiRuntimeError {
+            id,
+            source: source.to_string(),
+            message: message.to_string(),
+            stack: stack.map(ToString::to_string),
+            context: context.map(ToString::to_string),
+            timestamp: now,
+        })
+    }
+
+    pub fn list_ui_runtime_errors(&self, limit: usize) -> Result<Vec<UiRuntimeError>, DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, source, message, stack, context, timestamp
+             FROM ui_runtime_errors
+             ORDER BY timestamp DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok(UiRuntimeError {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                message: row.get(2)?,
+                stack: row.get(3)?,
+                context: row.get(4)?,
+                timestamp: row.get(5)?,
+            })
+        })?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    pub fn clear_ui_runtime_errors(&self) -> Result<(), DbError> {
+        let conn = self.conn.lock().map_err(|_| DbError::Lock)?;
+        conn.execute("DELETE FROM ui_runtime_errors", [])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -823,5 +911,30 @@ mod tests {
         }
         let loaded = db.get_settings().unwrap();
         assert!(!loaded.moltis_sidecar_enabled);
+    }
+
+    #[test]
+    fn ui_runtime_error_round_trip_and_limit() {
+        let db = in_memory_db();
+        db.add_ui_runtime_error(
+            "window.error",
+            "First failure",
+            Some("stack-1"),
+            Some("{\"line\":1}"),
+        )
+        .unwrap();
+        db.add_ui_runtime_error("task.run", "Second failure", None, None)
+            .unwrap();
+
+        let top1 = db.list_ui_runtime_errors(1).unwrap();
+        assert_eq!(top1.len(), 1);
+
+        let all = db.list_ui_runtime_errors(10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|entry| entry.source == "window.error"));
+        assert!(all.iter().any(|entry| entry.message == "Second failure"));
+
+        db.clear_ui_runtime_errors().unwrap();
+        assert!(db.list_ui_runtime_errors(10).unwrap().is_empty());
     }
 }

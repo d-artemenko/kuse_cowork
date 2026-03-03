@@ -19,8 +19,10 @@ Last reviewed: 2026-03-03
 - No Rust warnings promoted by clippy gate.
 - Settings, chat flow, and task flow still boot in local dev (`npm run tauri:dev`).
 - Moltis bridge proves auth-required runtime path (health + ws connect + `chat.send`) and fails without valid auth key.
+- Legacy hidden model settings cannot leak into Moltis RPC payload in task/chat runtime paths.
+- UI runtime exceptions and rejected promises are persisted into local diagnostics storage for harness inspection.
 
 ## Operability Claim Policy
 
 - Do not claim "Moltis works" unless `npm run check:moltis-runtime-harness` passes in the current branch state.
-- UI regressions are still possible; runtime harness confirms the desktop backend bridge contract without manual user action.
+- Before closing UI-only incidents, inspect stored runtime diagnostics via `list_ui_runtime_errors` (or direct DB query) to confirm no hidden frontend failures remain.
