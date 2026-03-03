@@ -13,7 +13,8 @@
     "check:moltis-only": "bash scripts/check_moltis_only.sh",
     "check:moltis-runtime-harness": "bash scripts/check_moltis_runtime_harness.sh",
     "check:moltis-smoke": "bash scripts/smoke_moltis_bridge.sh",
-    "diagnostics:ui-errors": "python3 scripts/dump_ui_runtime_errors.py --limit 100"
+    "diagnostics:ui-errors": "python3 scripts/dump_ui_runtime_errors.py --limit 100",
+    "diagnostics:moltis-live": "python3 scripts/check_moltis_live.py"
   },
   "dependencies": {
     "@solidjs/router": "^0.14.0",

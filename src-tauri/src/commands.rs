@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{command, Emitter, State, Window};
 use tokio::sync::Mutex;
+use url::Url;
 
 pub struct AppState {
     pub db: Arc<Database>,
@@ -282,14 +283,16 @@ async fn moltis_connection_status_with_settings(settings: &Settings) -> MoltisCo
     let health = match client.health().await {
         Ok(health) => health,
         Err(err) => {
+            let message = sidecar_connection_hint(settings, &err)
+                .unwrap_or_else(|| format_moltis_error(&err));
             return MoltisConnectionStatus {
                 ok: false,
                 version: None,
                 protocol: None,
                 server_url,
                 auth_mode,
-                error: Some(format_moltis_error(&err)),
-            }
+                error: Some(message),
+            };
         }
     };
 
@@ -354,6 +357,41 @@ fn format_moltis_error(err: &MoltisClientError) -> String {
             format!("Moltis protocol mismatch: server={server}, desktop supports {min}..{max}")
         }
         other => other.to_string(),
+    }
+}
+
+fn is_local_moltis_url(raw: &str) -> bool {
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    let normalized = if candidate.contains("://") {
+        candidate.to_string()
+    } else {
+        format!("http://{candidate}")
+    };
+    let Ok(url) = Url::parse(&normalized) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn sidecar_connection_hint(settings: &Settings, err: &MoltisClientError) -> Option<String> {
+    if !settings.moltis_sidecar_enabled {
+        return None;
+    }
+    if !is_local_moltis_url(&settings.moltis_server_url) {
+        return None;
+    }
+    match err {
+        MoltisClientError::Http(http_err) if http_err.is_connect() => Some(format!(
+            "Local Moltis sidecar mode is enabled, but no sidecar is reachable at {}. Start sidecar or disable sidecar mode and set a reachable Moltis server URL.",
+            settings.moltis_server_url.trim()
+        )),
+        _ => None,
     }
 }
 
@@ -1207,6 +1245,14 @@ mod tests {
         assert_eq!(entries[0].message.len(), 2000);
     }
 
+    #[test]
+    fn is_local_moltis_url_handles_common_local_hosts() {
+        assert!(is_local_moltis_url("http://127.0.0.1:13131"));
+        assert!(is_local_moltis_url("localhost:13131"));
+        assert!(is_local_moltis_url("http://[::1]:13131"));
+        assert!(!is_local_moltis_url("https://moltis.example.com"));
+    }
+
     async fn ws_read_json(
         socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     ) -> serde_json::Value {
@@ -1592,6 +1638,19 @@ mod tests {
             .contains("unauthorized"));
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn moltis_connection_status_hints_when_sidecar_enabled_but_offline() {
+        let mut settings = Settings::default();
+        settings.moltis_server_url = "http://127.0.0.1:9".to_string();
+        settings.moltis_sidecar_enabled = true;
+
+        let status = moltis_connection_status_with_settings(&settings).await;
+        assert!(!status.ok);
+        let message = status.error.unwrap_or_default();
+        assert!(message.contains("sidecar mode is enabled"));
+        assert!(message.contains("127.0.0.1:9"));
     }
 
     #[tokio::test]
