@@ -61,6 +61,32 @@ fn build_moltis_client(settings: &Settings) -> Result<MoltisClient, CommandError
     Ok(MoltisClient::new(cfg))
 }
 
+fn moltis_model_override(settings: &Settings) -> Option<String> {
+    let raw_model = settings.model.trim();
+    if raw_model.is_empty() {
+        return None;
+    }
+
+    // If a Moltis-style model id is already provided, pass it through.
+    if raw_model.contains("::") {
+        return Some(raw_model.to_string());
+    }
+
+    // Kuse model ids are typically provider-less (e.g. "gpt-5", "claude-sonnet-...").
+    // Moltis expects "provider::model" (or "openrouter::provider/model").
+    let provider = settings.get_provider();
+    match provider.as_str() {
+        "anthropic" | "openai" | "google" | "minimax" => Some(format!("{provider}::{raw_model}")),
+        "openrouter" => Some(format!("openrouter::{raw_model}")),
+        _ => None,
+    }
+}
+
+fn is_moltis_model_not_found_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("model") && lower.contains("not found")) || lower.contains("unknown model")
+}
+
 // Platform command
 #[command]
 pub fn get_platform() -> String {
@@ -303,9 +329,19 @@ pub async fn send_chat_message_via_moltis(
         .add_message(&user_msg_id, &conversation_id, "user", &content)?;
 
     let session_key = format!("kuse:{}", conversation_id);
-    let reply = client
-        .chat_send_and_wait(&session_key, &content, Some(&settings.model))
-        .await?;
+    let model_override = moltis_model_override(&settings);
+    let reply = match client
+        .chat_send_and_wait(&session_key, &content, model_override.as_deref())
+        .await
+    {
+        Ok(reply) => reply,
+        Err(MoltisClientError::Rpc { message, .. })
+            if model_override.is_some() && is_moltis_model_not_found_error(&message) =>
+        {
+            client.chat_send_and_wait(&session_key, &content, None).await?
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     let assistant_msg_id = uuid::Uuid::new_v4().to_string();
     state
