@@ -11,6 +11,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "check:moltis-only": "bash scripts/check_moltis_only.sh",
+    "check:moltis-runtime-harness": "bash scripts/check_moltis_runtime_harness.sh",
     "check:moltis-smoke": "bash scripts/smoke_moltis_bridge.sh"
   },
   "dependencies": {

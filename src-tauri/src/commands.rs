@@ -1050,6 +1050,8 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     fn settings_with_model(model: &str, provider: &str) -> Settings {
@@ -1135,12 +1137,103 @@ mod tests {
         socket.send(WsMessage::Text(text.into())).await.unwrap();
     }
 
+    async fn respond_health_with_optional_auth(
+        stream: &mut tokio::net::TcpStream,
+        expected_api_key: Option<&str>,
+        body: &str,
+    ) {
+        let mut buf = [0_u8; 4096];
+        let bytes = stream.read(&mut buf).await.unwrap();
+        let request = String::from_utf8_lossy(&buf[..bytes]);
+        let auth_header = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            Some(value.trim().to_string())
+        });
+        let authorized = match expected_api_key {
+            Some(key) => auth_header.as_deref() == Some(&format!("Bearer {key}")),
+            None => true,
+        };
+
+        if !authorized {
+            let body = r#"{"error":"unauthorized"}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            return;
+        }
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
     async fn ws_accept_and_handshake(
         listener: &TcpListener,
     ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let connect = ws_read_json(&mut socket).await;
+        let connect_id = connect
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+        ws_send_json(
+            &mut socket,
+            serde_json::json!({
+                "type":"res",
+                "id":connect_id,
+                "ok":true,
+                "payload":{"type":"hello-ok","protocol":3}
+            }),
+        )
+        .await;
+        socket
+    }
+
+    async fn ws_accept_and_handshake_with_auth(
+        listener: &TcpListener,
+        expected_api_key: Option<&str>,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let expected_header = expected_api_key.map(|key| format!("Bearer {key}"));
+        let mut socket = accept_hdr_async(stream, move |req: &Request, resp: Response| {
+            let auth = req
+                .headers()
+                .get("authorization")
+                .and_then(|h| h.to_str().ok())
+                .map(ToString::to_string);
+            assert_eq!(
+                auth, expected_header,
+                "missing/invalid Authorization header on websocket upgrade"
+            );
+            Ok(resp)
+        })
+        .await
+        .unwrap();
+
+        let connect = ws_read_json(&mut socket).await;
+        let auth_in_payload = connect
+            .get("params")
+            .and_then(|v| v.get("auth"))
+            .and_then(|v| v.get("api_key"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        assert_eq!(
+            auth_in_payload,
+            expected_api_key.map(ToString::to_string),
+            "connect.params.auth.api_key mismatch"
+        );
+
         let connect_id = connect
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -1240,6 +1333,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_helpers_propagate_auth_for_health_connect_and_chat() {
+        let required_api_key = "bridge-key";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut health_stream, _) = listener.accept().await.unwrap();
+            respond_health_with_optional_auth(
+                &mut health_stream,
+                Some(required_api_key),
+                r#"{"status":"ok","version":"5.5.5"}"#,
+            )
+            .await;
+
+            let mut socket =
+                ws_accept_and_handshake_with_auth(&listener, Some(required_api_key)).await;
+            let _ = socket.close(None).await;
+
+            let mut socket =
+                ws_accept_and_handshake_with_auth(&listener, Some(required_api_key)).await;
+            let req = ws_read_json(&mut socket).await;
+            let req_id = req
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                req.get("method").and_then(serde_json::Value::as_str),
+                Some("chat.send")
+            );
+            assert_eq!(
+                req.get("params")
+                    .and_then(|v| v.get("_session_key"))
+                    .and_then(serde_json::Value::as_str),
+                Some("kuse:conv-auth")
+            );
+
+            ws_send_json(
+                &mut socket,
+                serde_json::json!({
+                    "type":"res",
+                    "id": req_id,
+                    "ok": true,
+                    "payload": {"runId":"run-auth"}
+                }),
+            )
+            .await;
+            ws_send_json(
+                &mut socket,
+                serde_json::json!({
+                    "type":"event",
+                    "event":"chat",
+                    "payload":{
+                        "runId":"run-auth",
+                        "sessionKey":"kuse:conv-auth",
+                        "state":"final",
+                        "text":"Auth path OK"
+                    }
+                }),
+            )
+            .await;
+            let _ = socket.close(None).await;
+        });
+
+        let mut settings = Settings::default();
+        settings.moltis_server_url = format!("http://{addr}");
+        settings.moltis_api_key = required_api_key.to_string();
+
+        let status = test_moltis_connection_with_settings(&settings)
+            .await
+            .unwrap();
+        assert!(status.contains("version=5.5.5"));
+        assert!(status.contains("protocol=3"));
+
+        let db = Database::new_in_memory_for_tests().unwrap();
+        db.create_conversation("conv-auth", "tmp").unwrap();
+        let reply = send_chat_message_via_moltis_with_db(&db, &settings, "conv-auth", "ping")
+            .await
+            .unwrap();
+        assert_eq!(reply, "Auth path OK");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn bridge_helpers_validate_empty_method_for_moltis_call() {
         let settings = Settings::default();
         let err = moltis_call_with_settings(
@@ -1295,6 +1473,37 @@ mod tests {
         assert_eq!(status.auth_mode, "bearer");
         assert_eq!(status.version.as_deref(), Some("3.2.1"));
         assert_eq!(status.protocol, Some(3));
+    }
+
+    #[tokio::test]
+    async fn moltis_connection_status_reports_unauthorized_without_api_key() {
+        let required_api_key = "bridge-key";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut health_stream, _) = listener.accept().await.unwrap();
+            respond_health_with_optional_auth(
+                &mut health_stream,
+                Some(required_api_key),
+                r#"{"status":"ok","version":"7.7.7"}"#,
+            )
+            .await;
+        });
+
+        let mut settings = Settings::default();
+        settings.moltis_server_url = format!("http://{addr}");
+        settings.moltis_api_key = String::new();
+
+        let status = moltis_connection_status_with_settings(&settings).await;
+        assert!(!status.ok);
+        assert_eq!(status.auth_mode, "none");
+        assert!(status
+            .error
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains("unauthorized"));
+
+        server.await.unwrap();
     }
 
     #[tokio::test]
