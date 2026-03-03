@@ -18,4 +18,5 @@ fi
 
 echo "Re-checking Moltis live status after bootstrap..."
 python3 scripts/check_moltis_live.py
+npm run diagnostics:moltis-live-rpc
 echo "Autonomous Moltis validation passed."

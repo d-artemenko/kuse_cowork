@@ -15,6 +15,7 @@
     "check:moltis-smoke": "bash scripts/smoke_moltis_bridge.sh",
     "diagnostics:ui-errors": "python3 scripts/dump_ui_runtime_errors.py --limit 100",
     "diagnostics:moltis-live": "python3 scripts/check_moltis_live.py",
+    "diagnostics:moltis-live-rpc": "cd src-tauri && RUSTFLAGS='-Awarnings' cargo run --quiet --bin check_moltis_live_rpc",
     "diagnostics:moltis-start-local": "bash scripts/start_local_moltis_sidecar.sh",
     "diagnostics:moltis-start-ssh": "bash scripts/start_moltis_ssh_tunnel.sh",
     "diagnostics:moltis-validate-autonomous": "bash scripts/validate_moltis_autonomous.sh"
