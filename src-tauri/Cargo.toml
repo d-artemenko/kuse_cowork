@@ -6,6 +6,7 @@ authors = ["Kuse AI"]
 license = "MIT"
 repository = "https://github.com/kuse-ai/kuse-cowork"
 edition = "2021"
+default-run = "kuse-cowork"
 
 [lib]
 name = "kuse_cowork_lib"
