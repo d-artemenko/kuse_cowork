@@ -27,3 +27,4 @@ Last reviewed: 2026-03-03
 - Do not claim "Moltis works" unless `npm run check:moltis-runtime-harness` passes in the current branch state.
 - Before closing UI-only incidents, inspect stored runtime diagnostics via `list_ui_runtime_errors` (or direct DB query) to confirm no hidden frontend failures remain.
 - For live incidents on a developer machine, run `npm run diagnostics:moltis-live` to validate the current app DB settings against real `/health` reachability and auth behavior.
+- If live check fails with local sidecar mode, run `npm run diagnostics:moltis-validate-autonomous`; it first tries SSH bootstrap (`npm run diagnostics:moltis-start-ssh`) and then local source bootstrap (`npm run diagnostics:moltis-start-local`) before re-checking reachability.
