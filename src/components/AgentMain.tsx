@@ -14,7 +14,7 @@ interface AgentMainProps {
 }
 
 const AgentMain: Component<AgentMainProps> = (props) => {
-  const { isConfigured, toggleSettings } = useSettings();
+  const { isConfigured, toggleSettings, moltisStatus, refreshMoltisStatus } = useSettings();
   const [input, setInput] = createSignal("");
   const [selectedPaths, setSelectedPaths] = createSignal<string[]>([]);
   const [showPathsPanel, setShowPathsPanel] = createSignal(false);
@@ -37,10 +37,11 @@ const AgentMain: Component<AgentMainProps> = (props) => {
     setSelectedPaths(selectedPaths().filter(p => p !== path));
   };
 
-  const handleSubmit = (e: Event) => {
+  const handleSubmit = async (e: Event) => {
     e.preventDefault();
+    await refreshMoltisStatus();
     const message = input().trim();
-    if (!message || props.isRunning) return;
+    if (!message || props.isRunning || !moltisStatus().ok) return;
 
     // Join all selected paths with comma for Docker mounting
     const projectPath = selectedPaths().length > 0 ? selectedPaths().join(",") : undefined;
@@ -64,8 +65,13 @@ const AgentMain: Component<AgentMainProps> = (props) => {
         fallback={
           <div class="agent-setup">
             <h2>Welcome to Kuse Cowork</h2>
-            <p>Configure your API key to start using the agent</p>
-            <button onClick={toggleSettings}>Open Settings</button>
+            <p>
+              {moltisStatus().error
+                ? `Moltis is disconnected: ${moltisStatus().error}`
+                : "Configure Moltis server URL and API key to start."}
+            </p>
+            <button onClick={toggleSettings}>Open Moltis Settings</button>
+            <button class="ghost" onClick={refreshMoltisStatus}>Retry Connection</button>
           </div>
         }
       >
@@ -169,14 +175,14 @@ const AgentMain: Component<AgentMainProps> = (props) => {
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
-                      handleSubmit(e);
+                      void handleSubmit(e);
                     }
                   }}
                   placeholder={isInConversation()
                     ? "Continue the conversation..."
                     : "Describe a task... (e.g., 'Find and fix the authentication bug in auth.ts')"
                   }
-                  disabled={props.isRunning}
+                  disabled={props.isRunning || !moltisStatus().ok}
                   rows={3}
                 />
                 <div class="input-actions">
@@ -184,7 +190,7 @@ const AgentMain: Component<AgentMainProps> = (props) => {
                     type="button"
                     class={`path-toggle ${selectedPaths().length > 0 ? "active" : ""}`}
                     onClick={handleAddFolders}
-                    disabled={props.isRunning}
+                    disabled={props.isRunning || !moltisStatus().ok}
                     title="Add folders to mount"
                   >
                     📁
@@ -197,13 +203,17 @@ const AgentMain: Component<AgentMainProps> = (props) => {
                       type="button"
                       class="new-chat-btn ghost"
                       onClick={props.onNewConversation}
-                      disabled={props.isRunning}
+                      disabled={props.isRunning || !moltisStatus().ok}
                       title="Start new conversation"
                     >
                       +
                     </button>
                   </Show>
-                  <button type="submit" class="submit-btn" disabled={props.isRunning || !input().trim()}>
+                  <button
+                    type="submit"
+                    class="submit-btn"
+                    disabled={props.isRunning || !input().trim() || !moltisStatus().ok}
+                  >
                     {props.isRunning ? "Running..." : isInConversation() ? "Send" : "Start Task"}
                   </button>
                 </div>

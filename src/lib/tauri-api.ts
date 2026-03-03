@@ -17,6 +17,15 @@ export interface Settings {
   moltis_sidecar_enabled: boolean;
 }
 
+export interface MoltisConnectionStatus {
+  ok: boolean;
+  version: string | null;
+  protocol: number | null;
+  server_url: string;
+  auth_mode: "none" | "bearer";
+  error?: string;
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -176,35 +185,24 @@ export async function saveSettings(settings: Settings): Promise<void> {
 }
 
 export async function testConnection(): Promise<string> {
-  console.log("testConnection called, isTauri:", isTauri());
   if (!isTauri()) {
-    // Web fallback - use unified AI client
-    const settings = await getSettings();
-    if (!settings.api_key) return "No API key configured";
-
-    const { testConnection: testAIConnection } = await import("./ai-client");
-    const convertedSettings = {
-      apiKey: settings.api_key,
-      model: settings.model,
-      baseUrl: settings.base_url,
-      maxTokens: settings.max_tokens,
-      temperature: settings.temperature,
-      providerKeys: settings.provider_keys || {},
-    };
-
-    return testAIConnection(convertedSettings);
+    throw new Error("Connection tests require the desktop app");
   }
-  console.log("Calling Tauri invoke test_connection...");
-  const result = await invoke<string>("test_connection");
-  console.log("Tauri invoke result:", result);
-  return result;
+  return invoke<string>("test_connection");
 }
 
 export async function testMoltisConnection(): Promise<string> {
   if (!isTauri()) {
-    return "Moltis test is available only in Tauri mode";
+    throw new Error("Moltis test is available only in Tauri mode");
   }
   return invoke<string>("test_moltis_connection");
+}
+
+export async function getMoltisConnectionStatus(): Promise<MoltisConnectionStatus> {
+  if (!isTauri()) {
+    throw new Error("Moltis status is available only in Tauri mode");
+  }
+  return invoke<MoltisConnectionStatus>("get_moltis_connection_status");
 }
 
 // Conversations API
@@ -269,13 +267,6 @@ export async function getMessages(conversationId: string): Promise<Message[]> {
   return invoke<Message[]>("get_messages", { conversationId });
 }
 
-function saveMessagesLocal(conversationId: string, messages: Message[]) {
-  localStorage.setItem(
-    `kuse-cowork-messages-${conversationId}`,
-    JSON.stringify(messages)
-  );
-}
-
 // Chat API with streaming
 export async function sendChatMessage(
   conversationId: string,
@@ -283,52 +274,7 @@ export async function sendChatMessage(
   onStream: (text: string) => void
 ): Promise<string> {
   if (!isTauri()) {
-    // Web fallback - direct API call
-    const settings = await getSettings();
-    const messages = await getMessages(conversationId);
-
-    // Add user message
-    const userMsg: Message = {
-      id: crypto.randomUUID(),
-      conversation_id: conversationId,
-      role: "user",
-      content,
-      timestamp: Date.now(),
-    };
-    messages.push(userMsg);
-    saveMessagesLocal(conversationId, messages);
-
-    // Use unified AI client
-    const { sendMessage: sendAIMessage } = await import("./ai-client");
-    const convertedSettings = {
-      apiKey: settings.api_key,
-      model: settings.model,
-      baseUrl: settings.base_url,
-      maxTokens: settings.max_tokens,
-      temperature: settings.temperature,
-      providerKeys: settings.provider_keys || {},
-    };
-
-    const fullText = await sendAIMessage(messages, convertedSettings, onStream);
-
-    // Save assistant message
-    const assistantMsg: Message = {
-      id: crypto.randomUUID(),
-      conversation_id: conversationId,
-      role: "assistant",
-      content: fullText,
-      timestamp: Date.now(),
-    };
-    messages.push(assistantMsg);
-    saveMessagesLocal(conversationId, messages);
-
-    // Update title if first message
-    if (messages.length === 2) {
-      const title = content.length > 30 ? content.slice(0, 30) + "..." : content;
-      await updateConversationTitle(conversationId, title);
-    }
-
-    return fullText;
+    throw new Error("Chat is available only in desktop mode");
   }
 
   // Tauri mode - use Rust backend

@@ -1,6 +1,6 @@
-use crate::agent::{AgentConfig, AgentContent, AgentEvent, AgentLoop, AgentMessage};
-use crate::claude::{ClaudeClient, Message as ClaudeMessage};
-use crate::database::{Conversation, Database, Message, PlanStep, Settings, Task, TaskMessage};
+use crate::agent::AgentEvent;
+use crate::claude::ClaudeClient;
+use crate::database::{Conversation, Database, Message, Settings, Task, TaskMessage};
 use crate::mcp::{MCPManager, MCPServerConfig, MCPServerStatus, MCPToolCall, MCPToolResult};
 use crate::moltis_client::{MoltisClient, MoltisClientConfig, MoltisClientError};
 use crate::skills::{get_available_skills, SkillMetadata};
@@ -133,161 +133,18 @@ pub async fn save_settings(
 
     state.db.save_settings(&settings)?;
 
-    // Update Claude client with new settings
+    // Moltis-only mode does not keep direct provider clients hot.
     let mut client = state.claude_client.lock().await;
-    if !settings.api_key.is_empty() {
-        *client = Some(ClaudeClient::new(
-            settings.api_key.clone(),
-            Some(settings.base_url.clone()),
-        ));
-    } else {
-        *client = None;
-    }
+    *client = None;
 
     Ok(())
 }
 
 #[command]
 pub async fn test_connection(state: State<'_, Arc<AppState>>) -> Result<String, CommandError> {
-    use crate::llm_client::{LLMClient, Message};
-
     let settings = state.db.get_settings()?;
-
-    // Debug logging
-    println!("[test_connection] model: {}", settings.model);
-    println!("[test_connection] base_url: {}", settings.base_url);
-    println!(
-        "[test_connection] api_key length: {}",
-        settings.api_key.len()
-    );
-    println!("[test_connection] provider: {}", settings.get_provider());
-    println!(
-        "[test_connection] is_local_provider: {}, allows_empty_api_key: {}",
-        settings.is_local_provider(),
-        settings.allows_empty_api_key()
-    );
-
-    if settings.api_key.is_empty() && !settings.allows_empty_api_key() {
-        return Ok("No API key configured".to_string());
-    }
-
-    // Choose test method based on provider type
-    if settings.is_local_provider() {
-        // Local service - use LLMClient to check connection
-        let llm_client = LLMClient::new(
-            String::new(), // Local services don't need API key
-            Some(settings.base_url.clone()),
-            None,
-            Some(&settings.model),
-        );
-
-        match llm_client.check_connection().await {
-            Ok(true) => Ok("success".to_string()),
-            Ok(false) => Ok(
-                "Error: Cannot connect to local service, please ensure it is running".to_string(),
-            ),
-            Err(e) => Ok(format!("Error: {}", e)),
-        }
-    } else {
-        // Cloud service - check provider type
-        let provider = settings.get_provider();
-
-        match provider.as_str() {
-            "anthropic" => {
-                // Anthropic - use ClaudeClient
-                let client = ClaudeClient::new(settings.api_key, Some(settings.base_url));
-                let messages = vec![ClaudeMessage {
-                    role: "user".to_string(),
-                    content: "Hi".to_string(),
-                }];
-
-                match client
-                    .send_message(messages, &settings.model, 10, None)
-                    .await
-                {
-                    Ok(_) => Ok("success".to_string()),
-                    Err(e) => Ok(format!("Error: {}", e)),
-                }
-            }
-            "openai" => {
-                // OpenAI - test with actual API request using LLMClient
-                let llm_client = LLMClient::new_with_openai_headers(
-                    settings.api_key.clone(),
-                    Some(settings.base_url.clone()),
-                    Some("openai"),
-                    Some(&settings.model),
-                    settings.openai_organization.clone(),
-                    settings.openai_project.clone(),
-                );
-
-                let test_messages = vec![Message {
-                    role: "user".to_string(),
-                    content: "Hi".to_string(),
-                }];
-
-                // Send a minimal test request
-                match llm_client
-                    .send_message(test_messages, &settings.model, 10, None)
-                    .await
-                {
-                    Ok(_) => Ok("success".to_string()),
-                    Err(e) => Ok(format!("Error: {}", e)),
-                }
-            }
-            "google" => {
-                // Google Gemini - test with actual API request
-                let llm_client = LLMClient::new(
-                    settings.api_key.clone(),
-                    Some(settings.base_url.clone()),
-                    Some("google"),
-                    Some(&settings.model),
-                );
-
-                let test_messages = vec![Message {
-                    role: "user".to_string(),
-                    content: "Hi".to_string(),
-                }];
-
-                match llm_client
-                    .send_message(test_messages, &settings.model, 10, None)
-                    .await
-                {
-                    Ok(_) => Ok("success".to_string()),
-                    Err(e) => Ok(format!("Error: {}", e)),
-                }
-            }
-            _ => {
-                // Other cloud services - try sending a test message
-                let llm_client = LLMClient::new(
-                    settings.api_key.clone(),
-                    Some(settings.base_url.clone()),
-                    None,
-                    Some(&settings.model),
-                );
-
-                let test_messages = vec![Message {
-                    role: "user".to_string(),
-                    content: "Hi".to_string(),
-                }];
-
-                // Try to send a minimal test request
-                match llm_client
-                    .send_message(test_messages, &settings.model, 10, None)
-                    .await
-                {
-                    Ok(_) => Ok("success".to_string()),
-                    Err(e) => {
-                        // If sending fails, try simple connection check (for services that support it)
-                        match llm_client.check_connection().await {
-                            Ok(true) => Ok("success".to_string()),
-                            Ok(false) => Ok(format!("Error: {}", e)),
-                            Err(conn_e) => Ok(format!("Error: {}", conn_e)),
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Backward-compatible alias for legacy UI code; Moltis is the only connection path.
+    test_moltis_connection_with_settings(&settings).await
 }
 
 #[command]
@@ -296,6 +153,25 @@ pub async fn test_moltis_connection(
 ) -> Result<String, CommandError> {
     let settings = state.db.get_settings()?;
     test_moltis_connection_with_settings(&settings).await
+}
+
+#[derive(Debug, Serialize)]
+pub struct MoltisConnectionStatus {
+    pub ok: bool,
+    pub version: Option<String>,
+    pub protocol: Option<u32>,
+    pub server_url: String,
+    pub auth_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[command]
+pub async fn get_moltis_connection_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<MoltisConnectionStatus, CommandError> {
+    let settings = state.db.get_settings()?;
+    Ok(moltis_connection_status_with_settings(&settings).await)
 }
 
 #[command]
@@ -333,19 +209,117 @@ pub async fn send_chat_message_via_moltis(
 }
 
 async fn test_moltis_connection_with_settings(settings: &Settings) -> Result<String, CommandError> {
-    let client = build_moltis_client(settings)?;
+    let status = moltis_connection_status_with_settings(settings).await;
+    if !status.ok {
+        return Err(CommandError {
+            message: status
+                .error
+                .unwrap_or_else(|| "Moltis connection failed".to_string()),
+        });
+    }
+    let version = status.version.unwrap_or_else(|| "unknown".to_string());
+    let protocol = status.protocol.unwrap_or_default();
+    Ok(format!("success (version={version}, protocol={protocol})"))
+}
 
-    let health = client.health().await?;
-    let hello = client.check_ws_connection().await?;
+async fn moltis_connection_status_with_settings(settings: &Settings) -> MoltisConnectionStatus {
+    let auth_mode = if settings.moltis_api_key.trim().is_empty() {
+        "none".to_string()
+    } else {
+        "bearer".to_string()
+    };
+    let server_url = settings.moltis_server_url.trim().to_string();
+
+    let client = match build_moltis_client(settings) {
+        Ok(client) => client,
+        Err(err) => {
+            return MoltisConnectionStatus {
+                ok: false,
+                version: None,
+                protocol: None,
+                server_url,
+                auth_mode,
+                error: Some(err.message),
+            }
+        }
+    };
+
+    let health = match client.health().await {
+        Ok(health) => health,
+        Err(err) => {
+            return MoltisConnectionStatus {
+                ok: false,
+                version: None,
+                protocol: None,
+                server_url,
+                auth_mode,
+                error: Some(format_moltis_error(&err)),
+            }
+        }
+    };
+
+    let hello = match client.check_ws_connection().await {
+        Ok(hello) => hello,
+        Err(err) => {
+            return MoltisConnectionStatus {
+                ok: false,
+                version: health
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                protocol: None,
+                server_url,
+                auth_mode,
+                error: Some(format_moltis_error(&err)),
+            }
+        }
+    };
+
     let version = health
         .get("version")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+        .map(ToString::to_string);
     let protocol = hello
         .get("protocol")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    Ok(format!("success (version={version}, protocol={protocol})"))
+        .map(|p| p as u32);
+
+    MoltisConnectionStatus {
+        ok: true,
+        version,
+        protocol,
+        server_url,
+        auth_mode,
+        error: None,
+    }
+}
+
+fn format_moltis_error(err: &MoltisClientError) -> String {
+    match err {
+        MoltisClientError::UnsupportedScheme(scheme) => {
+            format!("Unsupported Moltis URL scheme '{scheme}'. Use http/https/ws/wss.")
+        }
+        MoltisClientError::InvalidUrl(_) => "Invalid Moltis server URL".to_string(),
+        MoltisClientError::Http(http) => match http.status() {
+            Some(reqwest::StatusCode::UNAUTHORIZED) | Some(reqwest::StatusCode::FORBIDDEN) => {
+                "Moltis authentication rejected (unauthorized)".to_string()
+            }
+            _ => format!("Moltis HTTP request failed: {http}"),
+        },
+        MoltisClientError::Rpc { code, message } => {
+            if code.eq_ignore_ascii_case("UNAUTHORIZED")
+                || message.to_ascii_lowercase().contains("unauthorized")
+            {
+                "Moltis authentication rejected (unauthorized)".to_string()
+            } else {
+                format!("Moltis RPC error [{code}]: {message}")
+            }
+        }
+        MoltisClientError::ProtocolMismatch { server, min, max } => {
+            format!("Moltis protocol mismatch: server={server}, desktop supports {min}..{max}")
+        }
+        other => other.to_string(),
+    }
 }
 
 async fn moltis_health_with_settings(
@@ -413,6 +387,33 @@ async fn send_chat_message_via_moltis_with_db(
         };
         db.update_conversation_title(conversation_id, &title)?;
     }
+
+    Ok(reply.text)
+}
+
+async fn send_task_message_via_moltis(
+    settings: &Settings,
+    task_id: &str,
+    content: &str,
+) -> Result<String, CommandError> {
+    let client = build_moltis_client(settings)?;
+    let session_key = format!("kuse-task:{task_id}");
+    let model_override = moltis_model_override(settings);
+
+    let reply = match client
+        .chat_send_and_wait(&session_key, content, model_override.as_deref())
+        .await
+    {
+        Ok(reply) => reply,
+        Err(MoltisClientError::Rpc { message, .. })
+            if model_override.is_some() && is_moltis_model_not_found_error(&message) =>
+        {
+            client
+                .chat_send_and_wait(&session_key, content, None)
+                .await?
+        }
+        Err(err) => return Err(err.into()),
+    };
 
     Ok(reply.text)
 }
@@ -494,95 +495,11 @@ pub async fn send_chat_message(
     conversation_id: String,
     content: String,
 ) -> Result<String, CommandError> {
-    use crate::llm_client::{LLMClient, Message as LLMMessage};
-
     let settings = state.db.get_settings()?;
+    let response =
+        send_chat_message_via_moltis_with_db(&state.db, &settings, &conversation_id, &content)
+            .await?;
 
-    if settings.api_key.is_empty() && !settings.allows_empty_api_key() {
-        return Err(CommandError {
-            message: "API key not configured".to_string(),
-        });
-    }
-
-    // Add user message to database
-    let user_msg_id = uuid::Uuid::new_v4().to_string();
-    state
-        .db
-        .add_message(&user_msg_id, &conversation_id, "user", &content)?;
-
-    // Get conversation history
-    let db_messages = state.db.get_messages(&conversation_id)?;
-
-    // Create channel for streaming
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-
-    // Spawn task to emit events
-    let window_clone = window.clone();
-    let emit_task = tokio::spawn(async move {
-        while let Some(text) = rx.recv().await {
-            let _ = window_clone.emit("chat-stream", StreamPayload { text, done: false });
-        }
-    });
-
-    // Choose client based on provider
-    let provider = settings.get_provider();
-    let response = match provider.as_str() {
-        "anthropic" => {
-            // Use ClaudeClient for Anthropic
-            let claude_messages: Vec<ClaudeMessage> = db_messages
-                .iter()
-                .map(|m| ClaudeMessage {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                })
-                .collect();
-            let client = ClaudeClient::new(settings.api_key, Some(settings.base_url));
-            client
-                .send_message_stream(
-                    claude_messages,
-                    &settings.model,
-                    settings.max_tokens,
-                    Some(settings.temperature),
-                    tx,
-                )
-                .await?
-        }
-        _ => {
-            // Use LLMClient for OpenAI and other providers
-            let llm_messages: Vec<LLMMessage> = db_messages
-                .iter()
-                .map(|m| LLMMessage {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                })
-                .collect();
-            let llm_client = LLMClient::new_with_openai_headers(
-                settings.api_key.clone(),
-                Some(settings.base_url.clone()),
-                Some(&provider),
-                Some(&settings.model),
-                settings.openai_organization.clone(),
-                settings.openai_project.clone(),
-            );
-            llm_client
-                .send_message_stream(
-                    llm_messages,
-                    &settings.model,
-                    settings.max_tokens,
-                    Some(settings.temperature),
-                    tx,
-                )
-                .await
-                .map_err(|e| CommandError {
-                    message: e.to_string(),
-                })?
-        }
-    };
-
-    // Wait for emit task to finish
-    let _ = emit_task.await;
-
-    // Emit done event
     let _ = window.emit(
         "chat-stream",
         StreamPayload {
@@ -590,24 +507,6 @@ pub async fn send_chat_message(
             done: true,
         },
     );
-
-    // Save assistant response to database
-    let assistant_msg_id = uuid::Uuid::new_v4().to_string();
-    state
-        .db
-        .add_message(&assistant_msg_id, &conversation_id, "assistant", &response)?;
-
-    // Update conversation title if this is the first message
-    if db_messages.len() == 1 {
-        let title = if content.len() > 30 {
-            format!("{}...", &content[..30])
-        } else {
-            content.clone()
-        };
-        state
-            .db
-            .update_conversation_title(&conversation_id, &title)?;
-    }
 
     Ok(response)
 }
@@ -648,88 +547,10 @@ pub async fn run_agent(
     state: State<'_, Arc<AppState>>,
     request: AgentRequest,
 ) -> Result<String, CommandError> {
-    let settings = state.db.get_settings()?;
-
-    // Check if API Key is needed (local services don't need it)
-    if settings.api_key.is_empty() && !settings.allows_empty_api_key() {
-        return Err(CommandError {
-            message: "API key not configured".to_string(),
-        });
-    }
-
-    // Build agent config
-    let mut config = AgentConfig::default();
-    if let Some(prompt) = request.system_prompt {
-        config.system_prompt = prompt;
-    } else {
-        // Add MCP servers info to default system prompt
-        let mcp_servers = state.mcp_manager.get_server_statuses().await;
-        let mut mcp_info = String::new();
-        if !mcp_servers.is_empty() {
-            mcp_info.push_str("\nMCP (Model Context Protocol) Tools:\n");
-            for server in mcp_servers {
-                if matches!(
-                    server.status,
-                    crate::mcp::types::ConnectionStatus::Connected
-                ) {
-                    mcp_info.push_str(&format!(
-                        "Server '{}' is connected with tools:\n",
-                        server.id
-                    ));
-                    for tool in server.tools {
-                        mcp_info.push_str(&format!(
-                            "  - {}: {} (use format: {}:{})\n",
-                            tool.name, tool.description, server.id, tool.name
-                        ));
-                    }
-                }
-            }
-        }
-        if !mcp_info.is_empty() {
-            config.system_prompt.push_str(&mcp_info);
-        }
-    }
-    if let Some(turns) = request.max_turns {
-        config.max_turns = turns;
-    }
-    config.project_path = request.project_path;
-
-    // Get provider info
-    let provider_id = settings.get_provider();
-
-    // Create agent loop with provider
-    let agent = AgentLoop::new_with_provider(
-        settings.api_key,
-        settings.base_url,
-        config,
-        settings.model,
-        settings.max_tokens,
-        Some(settings.temperature),
-        state.mcp_manager.clone(),
-        Some(&provider_id),
-    );
-
-    // Create channel for events
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(100);
-
-    // Spawn event emitter
-    let window_clone = window.clone();
-    let emit_task = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let _ = window_clone.emit("agent-event", &event);
-        }
-    });
-
-    // Run agent
-    let result = agent.run(request.message, tx).await;
-
-    // Wait for emitter to finish
-    let _ = emit_task.await;
-
-    match result {
-        Ok(_messages) => Ok("Agent completed successfully".to_string()),
-        Err(e) => Err(CommandError { message: e }),
-    }
+    let _ = (window, state, request);
+    Err(CommandError {
+        message: "Direct provider agent mode is disabled. Use Moltis-backed task flow.".to_string(),
+    })
 }
 
 // Enhanced chat with tools - integrates agent capabilities into chat
@@ -747,719 +568,10 @@ pub async fn send_chat_with_tools(
     state: State<'_, Arc<AppState>>,
     request: EnhancedChatRequest,
 ) -> Result<String, CommandError> {
-    use crate::agent::{
-        AgentConfig, AgentContent, AgentMessage, ContentBlock, MessageBuilder, ToolExecutor,
-        ToolUse,
-    };
-    use futures::StreamExt;
-
-    let settings = state.db.get_settings()?;
-
-    if settings.api_key.is_empty() && !settings.allows_empty_api_key() {
-        return Err(CommandError {
-            message: "API key not configured".to_string(),
-        });
-    }
-
-    // Add user message to database
-    let user_msg_id = uuid::Uuid::new_v4().to_string();
-    state.db.add_message(
-        &user_msg_id,
-        &request.conversation_id,
-        "user",
-        &request.content,
-    )?;
-
-    // Get conversation history
-    let db_messages = state.db.get_messages(&request.conversation_id)?;
-
-    // If tools are not enabled, fall back to simple chat
-    if !request.enable_tools {
-        use crate::llm_client::{LLMClient, Message as LLMMessage};
-
-        let provider = settings.get_provider();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-
-        let window_clone = window.clone();
-        let emit_task = tokio::spawn(async move {
-            while let Some(text) = rx.recv().await {
-                let _ = window_clone.emit("chat-event", ChatEvent::Text { content: text });
-            }
-        });
-
-        let response = match provider.as_str() {
-            "anthropic" => {
-                // Use ClaudeClient for Anthropic
-                let claude_messages: Vec<ClaudeMessage> = db_messages
-                    .iter()
-                    .map(|m| ClaudeMessage {
-                        role: m.role.clone(),
-                        content: m.content.clone(),
-                    })
-                    .collect();
-                let client =
-                    ClaudeClient::new(settings.api_key.clone(), Some(settings.base_url.clone()));
-                client
-                    .send_message_stream(
-                        claude_messages,
-                        &settings.model,
-                        settings.max_tokens,
-                        Some(settings.temperature),
-                        tx,
-                    )
-                    .await?
-            }
-            _ => {
-                // Use LLMClient for OpenAI and other providers
-                let llm_messages: Vec<LLMMessage> = db_messages
-                    .iter()
-                    .map(|m| LLMMessage {
-                        role: m.role.clone(),
-                        content: m.content.clone(),
-                    })
-                    .collect();
-                let llm_client = LLMClient::new_with_openai_headers(
-                    settings.api_key.clone(),
-                    Some(settings.base_url.clone()),
-                    Some(&provider),
-                    Some(&settings.model),
-                    settings.openai_organization.clone(),
-                    settings.openai_project.clone(),
-                );
-                llm_client
-                    .send_message_stream(
-                        llm_messages,
-                        &settings.model,
-                        settings.max_tokens,
-                        Some(settings.temperature),
-                        tx,
-                    )
-                    .await
-                    .map_err(|e| CommandError {
-                        message: e.to_string(),
-                    })?
-            }
-        };
-
-        let _ = emit_task.await;
-        let _ = window.emit(
-            "chat-event",
-            ChatEvent::Done {
-                final_text: response.clone(),
-            },
-        );
-
-        // Save assistant response
-        let assistant_msg_id = uuid::Uuid::new_v4().to_string();
-        state.db.add_message(
-            &assistant_msg_id,
-            &request.conversation_id,
-            "assistant",
-            &response,
-        )?;
-
-        return Ok(response);
-    }
-
-    // Enhanced chat with tools - use AgentLoop which supports multiple providers
-    use crate::llm_client::ProviderConfig;
-
-    let tool_executor =
-        ToolExecutor::new(request.project_path.clone()).with_mcp_manager(state.mcp_manager.clone());
-
-    // Build agent-style config for tools
-    let mut config = AgentConfig {
-        project_path: request.project_path,
-        max_turns: 10, // Limit turns in chat mode
-        ..Default::default()
-    };
-
-    // System prompt for chat with tools - include MCP servers info
-    let mcp_servers = state.mcp_manager.get_server_statuses().await;
-    let mut mcp_info = String::new();
-    if !mcp_servers.is_empty() {
-        mcp_info.push_str("\nMCP (Model Context Protocol) Tools:\n");
-        for server in mcp_servers {
-            if matches!(
-                server.status,
-                crate::mcp::types::ConnectionStatus::Connected
-            ) {
-                mcp_info.push_str(&format!(
-                    "Server '{}' is connected with tools:\n",
-                    server.id
-                ));
-                for tool in server.tools {
-                    mcp_info.push_str(&format!(
-                        "  - {}: {} (use format: {}:{})\n",
-                        tool.name, tool.description, server.id, tool.name
-                    ));
-                }
-            }
-        }
-    }
-
-    config.system_prompt = format!(
-        r#"You are Kuse Cowork, an AI assistant that helps users for non dev work.
-
-You have access to tools that allow you to read and write files, execute commands, and search through codebases.
-
-When the user asks you to do something that requires accessing files or running commands, use the appropriate tools.
-For simple questions or conversations, respond directly without using tools.
-
-Be concise and helpful. Explain what you're doing when using tools.{}"#,
-        mcp_info
-    );
-
-    let message_builder = MessageBuilder::new(
-        config.clone(),
-        settings.model.clone(),
-        settings.max_tokens,
-        Some(settings.temperature),
-    );
-
-    // Convert DB messages to agent messages
-    let mut agent_messages: Vec<AgentMessage> = db_messages
-        .iter()
-        .map(|m| AgentMessage {
-            role: m.role.clone(),
-            content: AgentContent::Text(m.content.clone()),
-        })
-        .collect();
-
-    let client = reqwest::Client::new();
-    let mut final_text = String::new();
-    let mut turn = 0;
-    let max_turns = config.max_turns;
-
-    // Get provider config for determining API format
-    let provider_id = settings.get_provider();
-    let mut provider_config = ProviderConfig::from_preset(&provider_id);
-    if !settings.base_url.is_empty() {
-        provider_config.base_url = settings.base_url.clone();
-    }
-
-    // Determine API format
-    let use_openai_format = matches!(
-        provider_config.api_format,
-        crate::llm_client::ApiFormat::OpenAI | crate::llm_client::ApiFormat::OpenAICompatible
-    );
-    let use_google_format = matches!(
-        provider_config.api_format,
-        crate::llm_client::ApiFormat::Google
-    );
-
-    // For Google: track thoughtSignature per function call across iterations (required for Gemini 3)
-    let mut google_thought_signatures: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-
-    loop {
-        turn += 1;
-        if turn > max_turns {
-            break;
-        }
-
-        // Build and send request
-        let api_request = message_builder.build_request(&agent_messages).await;
-
-        let response = if use_google_format {
-            // Google Gemini format request (pass thought signatures for Gemini 3 function calling)
-            let google_request = convert_to_google_format(
-                &api_request,
-                &settings.model,
-                settings.max_tokens,
-                &google_thought_signatures,
-            );
-            let base = provider_config.base_url.trim_end_matches('/');
-            let url = format!(
-                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
-                base, settings.model
-            );
-
-            client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("x-goog-api-key", &settings.api_key)
-                .json(&google_request)
-                .send()
-                .await
-                .map_err(|e| CommandError {
-                    message: format!("HTTP error: {}", e),
-                })?
-        } else if use_openai_format {
-            // OpenAI format request
-            let openai_request = convert_to_openai_format(&api_request, &settings.model);
-            let base = provider_config.base_url.trim_end_matches('/');
-            let url = if base.ends_with("/v1") {
-                format!("{}/chat/completions", base)
-            } else {
-                format!("{}/v1/chat/completions", base)
-            };
-
-            let mut req = client.post(&url).header("Content-Type", "application/json");
-
-            if !settings.api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", settings.api_key));
-            }
-            // Add optional OpenAI headers
-            if let Some(ref org) = settings.openai_organization {
-                if !org.is_empty() {
-                    req = req.header("OpenAI-Organization", org);
-                }
-            }
-            if let Some(ref proj) = settings.openai_project {
-                if !proj.is_empty() {
-                    req = req.header("OpenAI-Project", proj);
-                }
-            }
-
-            req.json(&openai_request)
-                .send()
-                .await
-                .map_err(|e| CommandError {
-                    message: format!("HTTP error: {}", e),
-                })?
-        } else {
-            // Anthropic format request
-            client
-                .post(format!(
-                    "{}/v1/messages",
-                    provider_config.base_url.trim_end_matches('/')
-                ))
-                .header("Content-Type", "application/json")
-                .header("x-api-key", &settings.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&api_request)
-                .send()
-                .await
-                .map_err(|e| CommandError {
-                    message: format!("HTTP error: {}", e),
-                })?
-        };
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(CommandError {
-                message: format!("API error: {}", error_text),
-            });
-        }
-
-        // Handle streaming response based on provider format
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut accumulated_text = String::new();
-        let mut tool_uses: Vec<ToolUse> = Vec::new();
-
-        if use_google_format {
-            // Google Gemini streaming format (SSE with alt=sse)
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| CommandError {
-                    message: format!("Stream error: {}", e),
-                })?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    // Parse SSE data: prefix
-                    let json_str = if let Some(data) = line.strip_prefix("data: ") {
-                        data
-                    } else {
-                        continue;
-                    };
-
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        // Extract text and function calls from candidates
-                        if let Some(candidates) = event.get("candidates").and_then(|v| v.as_array())
-                        {
-                            for candidate in candidates {
-                                if let Some(parts) = candidate
-                                    .get("content")
-                                    .and_then(|c| c.get("parts"))
-                                    .and_then(|p| p.as_array())
-                                {
-                                    for part in parts {
-                                        // Handle text
-                                        if let Some(text) =
-                                            part.get("text").and_then(|v| v.as_str())
-                                        {
-                                            if !text.is_empty() {
-                                                accumulated_text.push_str(text);
-                                                let _ = window.emit(
-                                                    "chat-event",
-                                                    ChatEvent::Text {
-                                                        content: accumulated_text.clone(),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        // Handle function calls (with thoughtSignature for Gemini 3)
-                                        if let Some(fc) = part.get("functionCall") {
-                                            let name = fc
-                                                .get("name")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let args = fc
-                                                .get("args")
-                                                .cloned()
-                                                .unwrap_or(serde_json::json!({}));
-                                            let id = format!("fc_{}", uuid::Uuid::new_v4());
-
-                                            // Capture thoughtSignature from the same part (required for Gemini 3)
-                                            let thought_signature = part
-                                                .get("thoughtSignature")
-                                                .and_then(|v| v.as_str())
-                                                .map(|s| s.to_string());
-
-                                            // Also store in map for lookup when building functionResponse
-                                            if let Some(ref sig) = thought_signature {
-                                                google_thought_signatures
-                                                    .insert(id.clone(), sig.clone());
-                                            }
-
-                                            tool_uses.push(ToolUse {
-                                                id: id.clone(),
-                                                name: name.clone(),
-                                                input: args.clone(),
-                                                thought_signature,
-                                            });
-
-                                            let _ = window.emit(
-                                                "chat-event",
-                                                ChatEvent::ToolStart {
-                                                    tool: name,
-                                                    input: args,
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else if use_openai_format {
-            // OpenAI streaming format
-            let mut current_tool_calls: std::collections::HashMap<i64, (String, String, String)> =
-                std::collections::HashMap::new();
-
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| CommandError {
-                    message: format!("Stream error: {}", e),
-                })?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data.trim() == "[DONE]" {
-                            continue;
-                        }
-
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                            if let Some(choices) = event.get("choices").and_then(|v| v.as_array()) {
-                                for choice in choices {
-                                    if let Some(delta) = choice.get("delta") {
-                                        // Handle text content
-                                        if let Some(content) =
-                                            delta.get("content").and_then(|v| v.as_str())
-                                        {
-                                            accumulated_text.push_str(content);
-                                            let _ = window.emit(
-                                                "chat-event",
-                                                ChatEvent::Text {
-                                                    content: accumulated_text.clone(),
-                                                },
-                                            );
-                                        }
-
-                                        // Handle tool_calls
-                                        if let Some(tcs) =
-                                            delta.get("tool_calls").and_then(|v| v.as_array())
-                                        {
-                                            for tc in tcs {
-                                                let index = tc
-                                                    .get("index")
-                                                    .and_then(|v| v.as_i64())
-                                                    .unwrap_or(0);
-
-                                                let entry = current_tool_calls
-                                                    .entry(index)
-                                                    .or_insert_with(|| {
-                                                        (
-                                                            String::new(),
-                                                            String::new(),
-                                                            String::new(),
-                                                        )
-                                                    });
-
-                                                if let Some(id) =
-                                                    tc.get("id").and_then(|v| v.as_str())
-                                                {
-                                                    entry.0 = id.to_string();
-                                                }
-                                                if let Some(func) = tc.get("function") {
-                                                    if let Some(name) =
-                                                        func.get("name").and_then(|v| v.as_str())
-                                                    {
-                                                        entry.1 = name.to_string();
-                                                    }
-                                                    if let Some(args) = func
-                                                        .get("arguments")
-                                                        .and_then(|v| v.as_str())
-                                                    {
-                                                        entry.2.push_str(args);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Check if finished
-                                    if choice
-                                        .get("finish_reason")
-                                        .and_then(|v| v.as_str())
-                                        .is_some()
-                                    {
-                                        // Convert collected tool_calls to ToolUse
-                                        for (id, name, args) in current_tool_calls.values() {
-                                            if !id.is_empty() && !name.is_empty() {
-                                                let input: serde_json::Value =
-                                                    serde_json::from_str(args)
-                                                        .unwrap_or(serde_json::json!({}));
-
-                                                tool_uses.push(ToolUse {
-                                                    id: id.clone(),
-                                                    name: name.clone(),
-                                                    input: input.clone(),
-                                                    thought_signature: None, // OpenAI doesn't use thought signatures
-                                                });
-
-                                                // Emit tool start
-                                                let _ = window.emit(
-                                                    "chat-event",
-                                                    ChatEvent::ToolStart {
-                                                        tool: name.clone(),
-                                                        input,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Anthropic streaming format
-            let mut current_tool_input = String::new();
-            let mut current_tool_id = String::new();
-            let mut current_tool_name = String::new();
-
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| CommandError {
-                    message: format!("Stream error: {}", e),
-                })?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer = buffer[pos + 1..].to_string();
-
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            continue;
-                        }
-
-                        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                            let event_type =
-                                event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-                            match event_type {
-                                "content_block_start" => {
-                                    if let Some(block) = event.get("content_block") {
-                                        if block.get("type").and_then(|v| v.as_str())
-                                            == Some("tool_use")
-                                        {
-                                            current_tool_id = block
-                                                .get("id")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            current_tool_name = block
-                                                .get("name")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            current_tool_input.clear();
-                                        }
-                                    }
-                                }
-                                "content_block_delta" => {
-                                    if let Some(delta) = event.get("delta") {
-                                        let delta_type = delta
-                                            .get("type")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-
-                                        if delta_type == "text_delta" {
-                                            if let Some(text) =
-                                                delta.get("text").and_then(|v| v.as_str())
-                                            {
-                                                accumulated_text.push_str(text);
-                                                let _ = window.emit(
-                                                    "chat-event",
-                                                    ChatEvent::Text {
-                                                        content: accumulated_text.clone(),
-                                                    },
-                                                );
-                                            }
-                                        } else if delta_type == "input_json_delta" {
-                                            if let Some(partial) =
-                                                delta.get("partial_json").and_then(|v| v.as_str())
-                                            {
-                                                current_tool_input.push_str(partial);
-                                            }
-                                        }
-                                    }
-                                }
-                                "content_block_stop" => {
-                                    if !current_tool_id.is_empty() {
-                                        let input: serde_json::Value =
-                                            serde_json::from_str(&current_tool_input)
-                                                .unwrap_or(serde_json::json!({}));
-
-                                        tool_uses.push(ToolUse {
-                                            id: current_tool_id.clone(),
-                                            name: current_tool_name.clone(),
-                                            input: input.clone(),
-                                            thought_signature: None, // Anthropic doesn't use thought signatures
-                                        });
-
-                                        // Emit tool start
-                                        let _ = window.emit(
-                                            "chat-event",
-                                            ChatEvent::ToolStart {
-                                                tool: current_tool_name.clone(),
-                                                input,
-                                            },
-                                        );
-
-                                        current_tool_id.clear();
-                                        current_tool_name.clear();
-                                        current_tool_input.clear();
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Update final text
-        if !accumulated_text.is_empty() {
-            final_text = accumulated_text.clone();
-        }
-
-        // Add assistant message to history
-        let assistant_content = if tool_uses.is_empty() {
-            AgentContent::Text(accumulated_text)
-        } else {
-            let mut blocks = Vec::new();
-            if !accumulated_text.is_empty() {
-                blocks.push(ContentBlock::Text {
-                    text: accumulated_text,
-                });
-            }
-            for tu in &tool_uses {
-                blocks.push(ContentBlock::ToolUse {
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                    input: tu.input.clone(),
-                    thought_signature: tu.thought_signature.clone(),
-                });
-            }
-            AgentContent::Blocks(blocks)
-        };
-
-        agent_messages.push(AgentMessage {
-            role: "assistant".to_string(),
-            content: assistant_content,
-        });
-
-        // If no tool uses, we're done
-        if tool_uses.is_empty() {
-            break;
-        }
-
-        // Execute tools
-        let mut tool_results = Vec::new();
-
-        for tool_use in &tool_uses {
-            let result = tool_executor.execute(tool_use).await;
-
-            // Emit tool end
-            let _ = window.emit(
-                "chat-event",
-                ChatEvent::ToolEnd {
-                    tool: tool_use.name.clone(),
-                    result: result.content.clone(),
-                    success: result.is_error.is_none(),
-                },
-            );
-
-            tool_results.push(result);
-        }
-
-        // Add tool results as user message
-        agent_messages.push(AgentMessage {
-            role: "user".to_string(),
-            content: AgentContent::ToolResults(tool_results),
-        });
-    }
-
-    // Emit done
-    let _ = window.emit(
-        "chat-event",
-        ChatEvent::Done {
-            final_text: final_text.clone(),
-        },
-    );
-
-    // Save final assistant response to database
-    let assistant_msg_id = uuid::Uuid::new_v4().to_string();
-    state.db.add_message(
-        &assistant_msg_id,
-        &request.conversation_id,
-        "assistant",
-        &final_text,
-    )?;
-
-    // Update conversation title if this is the first exchange
-    if db_messages.len() == 1 {
-        let title = if request.content.len() > 30 {
-            format!("{}...", &request.content[..30])
-        } else {
-            request.content.clone()
-        };
-        state
-            .db
-            .update_conversation_title(&request.conversation_id, &title)?;
-    }
-
-    Ok(final_text)
+    let _ = (window, state, request);
+    Err(CommandError {
+        message: "Tool-enabled chat is disabled in Moltis-only mode.".to_string(),
+    })
 }
 
 // Task commands
@@ -1509,16 +621,6 @@ pub async fn run_task_agent(
 ) -> Result<String, CommandError> {
     let settings = state.db.get_settings()?;
 
-    // Check if API Key is needed (local services don't need it)
-    if settings.api_key.is_empty() && !settings.allows_empty_api_key() {
-        return Err(CommandError {
-            message: "API key not configured".to_string(),
-        });
-    }
-
-    // Load existing conversation history
-    let existing_messages = state.db.get_task_messages(&request.task_id)?;
-
     // Save new user message
     let user_msg_id = uuid::Uuid::new_v4().to_string();
     state
@@ -1527,161 +629,39 @@ pub async fn run_task_agent(
 
     // Update task status to running
     state.db.update_task_status(&request.task_id, "running")?;
-
-    // Build agent config with MCP servers info
-    let mut config = AgentConfig::default();
-
-    // Add MCP servers info to system prompt
-    let mcp_servers = state.mcp_manager.get_server_statuses().await;
-    let mut mcp_info = String::new();
-    if !mcp_servers.is_empty() {
-        mcp_info.push_str("\nMCP (Model Context Protocol) Tools:\n");
-        for server in mcp_servers {
-            if matches!(
-                server.status,
-                crate::mcp::types::ConnectionStatus::Connected
-            ) {
-                mcp_info.push_str(&format!(
-                    "Server '{}' is connected with tools:\n",
-                    server.id
-                ));
-                for tool in server.tools {
-                    mcp_info.push_str(&format!(
-                        "  - {}: {} (use format: {}:{})\n",
-                        tool.name, tool.description, server.id, tool.name
-                    ));
-                }
+    let final_text =
+        match send_task_message_via_moltis(&settings, &request.task_id, &request.message).await {
+            Ok(text) => text,
+            Err(err) => {
+                let _ = state.db.update_task_status(&request.task_id, "failed");
+                let _ = window.emit(
+                    "agent-event",
+                    AgentEvent::Error {
+                        message: err.message.clone(),
+                    },
+                );
+                return Err(err);
             }
-        }
-    }
-    if !mcp_info.is_empty() {
-        config.system_prompt.push_str(&mcp_info);
-    }
+        };
 
-    if let Some(turns) = request.max_turns {
-        config.max_turns = turns;
-    }
-    config.project_path = request.project_path;
+    let assistant_msg_id = uuid::Uuid::new_v4().to_string();
+    state.db.add_task_message(
+        &assistant_msg_id,
+        &request.task_id,
+        "assistant",
+        &final_text,
+    )?;
+    state.db.update_task_status(&request.task_id, "completed")?;
 
-    // Get provider info
-    let provider_id = settings.get_provider();
-
-    // Create agent loop with provider
-    let agent = AgentLoop::new_with_provider(
-        settings.api_key,
-        settings.base_url,
-        config,
-        settings.model,
-        settings.max_tokens,
-        Some(settings.temperature),
-        state.mcp_manager.clone(),
-        Some(&provider_id),
+    let _ = window.emit(
+        "agent-event",
+        AgentEvent::Text {
+            content: final_text.clone(),
+        },
     );
+    let _ = window.emit("agent-event", AgentEvent::Done { total_turns: 1 });
 
-    // Build conversation history from existing messages
-    let mut agent_messages: Vec<AgentMessage> = existing_messages
-        .iter()
-        .map(|m| AgentMessage {
-            role: m.role.clone(),
-            content: AgentContent::Text(m.content.clone()),
-        })
-        .collect();
-
-    // Add the new user message
-    agent_messages.push(AgentMessage {
-        role: "user".to_string(),
-        content: AgentContent::Text(request.message.clone()),
-    });
-
-    // Create channel for events
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(100);
-
-    // Clone state for event handler
-    let task_id = request.task_id.clone();
-    let task_id_for_msg = request.task_id.clone();
-    let db = state.db.clone();
-    let db_for_msg = state.db.clone();
-
-    // Track accumulated text for saving
-    let accumulated_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let accumulated_text_clone = accumulated_text.clone();
-
-    // Spawn event emitter with task tracking
-    let window_clone = window.clone();
-    let emit_task = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            // Track plan and step updates in database
-            match &event {
-                AgentEvent::Text { content } => {
-                    // Update accumulated text
-                    if let Ok(mut text) = accumulated_text_clone.lock() {
-                        *text = content.clone();
-                    }
-                }
-                AgentEvent::Plan { steps } => {
-                    let plan_steps: Vec<PlanStep> = steps
-                        .iter()
-                        .map(|s| PlanStep {
-                            step: s.step,
-                            description: s.description.clone(),
-                            status: "pending".to_string(),
-                        })
-                        .collect();
-                    let _ = db.update_task_plan(&task_id, &plan_steps);
-                }
-                AgentEvent::StepStart { step } => {
-                    let _ = db.update_task_step(&task_id, *step, "running");
-                }
-                AgentEvent::StepDone { step } => {
-                    let _ = db.update_task_step(&task_id, *step, "completed");
-                }
-                AgentEvent::Done { .. } => {
-                    let _ = db.update_task_status(&task_id, "completed");
-                }
-                AgentEvent::Error { .. } => {
-                    let _ = db.update_task_status(&task_id, "failed");
-                }
-                _ => {}
-            }
-
-            // Emit to frontend
-            let _ = window_clone.emit("agent-event", &event);
-        }
-    });
-
-    // Run agent with conversation history
-    let result = agent.run_with_history(agent_messages, tx).await;
-
-    // Wait for emitter to finish
-    let _ = emit_task.await;
-
-    // Save assistant message with accumulated text
-    let final_text = accumulated_text
-        .lock()
-        .map(|t| t.clone())
-        .unwrap_or_default();
-    if !final_text.is_empty() {
-        let assistant_msg_id = uuid::Uuid::new_v4().to_string();
-        let _ = db_for_msg.add_task_message(
-            &assistant_msg_id,
-            &task_id_for_msg,
-            "assistant",
-            &final_text,
-        );
-    }
-
-    // Always ensure task status is updated at the end
-    match result {
-        Ok(_messages) => {
-            // Explicitly update to completed (in case event was missed)
-            let _ = state.db.update_task_status(&request.task_id, "completed");
-            Ok("Task completed successfully".to_string())
-        }
-        Err(e) => {
-            state.db.update_task_status(&request.task_id, "failed")?;
-            Err(CommandError { message: e })
-        }
-    }
+    Ok("Task completed successfully".to_string())
 }
 
 // Get task messages command
@@ -2272,6 +1252,49 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.message.contains("Method name is required"));
+    }
+
+    #[tokio::test]
+    async fn moltis_connection_status_reports_success_and_validation_errors() {
+        let mut invalid = Settings::default();
+        invalid.moltis_server_url = "   ".to_string();
+        let invalid_status = moltis_connection_status_with_settings(&invalid).await;
+        assert!(!invalid_status.ok);
+        assert!(invalid_status
+            .error
+            .unwrap_or_default()
+            .contains("Moltis server URL not configured"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            async fn respond_health(stream: &mut tokio::net::TcpStream) {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let body = r#"{"status":"ok","version":"3.2.1"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            let (mut health_stream, _) = listener.accept().await.unwrap();
+            respond_health(&mut health_stream).await;
+
+            let mut socket = ws_accept_and_handshake(&listener).await;
+            let _ = socket.close(None).await;
+        });
+
+        let mut valid = Settings::default();
+        valid.moltis_server_url = format!("http://{addr}");
+        valid.moltis_api_key = "bridge-key".to_string();
+        let status = moltis_connection_status_with_settings(&valid).await;
+        assert!(status.ok);
+        assert_eq!(status.auth_mode, "bearer");
+        assert_eq!(status.version.as_deref(), Some("3.2.1"));
+        assert_eq!(status.protocol, Some(3));
     }
 
     #[tokio::test]

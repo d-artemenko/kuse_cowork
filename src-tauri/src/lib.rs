@@ -44,6 +44,7 @@ pub fn run() {
             commands::save_settings,
             commands::test_connection,
             commands::test_moltis_connection,
+            commands::get_moltis_connection_status,
             commands::moltis_health,
             commands::moltis_call,
             commands::send_chat_message_via_moltis,
@@ -92,7 +93,10 @@ pub fn run() {
                         for server in servers {
                             if server.enabled {
                                 if let Err(e) = mcp_manager.connect_server(&server).await {
-                                    eprintln!("Failed to auto-connect MCP server '{}': {}", server.name, e);
+                                    eprintln!(
+                                        "Failed to auto-connect MCP server '{}': {}",
+                                        server.name, e
+                                    );
                                 } else {
                                     println!("Auto-connected MCP server: {}", server.name);
                                 }

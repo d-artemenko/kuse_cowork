@@ -324,7 +324,7 @@ impl MoltisClient {
         >,
     ) -> Result<Value, MoltisClientError> {
         let connect_id = format!("connect-{}", uuid::Uuid::new_v4());
-        let mut params = json!({
+        let params = json!({
             "minProtocol": self.cfg.min_protocol,
             "maxProtocol": self.cfg.max_protocol,
             "client": {
@@ -334,15 +334,6 @@ impl MoltisClient {
                 "mode": "operator"
             }
         });
-        if let Some(key) = self
-            .cfg
-            .api_key
-            .as_ref()
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty())
-        {
-            params["auth"] = json!({ "api_key": key });
-        }
 
         self.send_json(
             socket,

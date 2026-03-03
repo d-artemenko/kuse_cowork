@@ -1,6 +1,8 @@
 import { createSignal } from "solid-js";
 import {
   getSettings as getSettingsApi,
+  getMoltisConnectionStatus as getMoltisConnectionStatusApi,
+  MoltisConnectionStatus as ApiMoltisConnectionStatus,
   saveSettings as saveSettingsApi,
   Settings as ApiSettings,
 } from "../lib/tauri-api";
@@ -17,6 +19,15 @@ export interface Settings {
   moltisServerUrl: string;
   moltisApiKey: string;
   moltisSidecarEnabled: boolean;
+}
+
+export interface MoltisConnectionStatus {
+  ok: boolean;
+  version: string | null;
+  protocol: number | null;
+  serverUrl: string;
+  authMode: "none" | "bearer";
+  error?: string;
 }
 
 // Provider configuration type
@@ -298,8 +309,43 @@ function toApiSettings(settings: Settings): ApiSettings {
 }
 
 const [settings, setSettings] = createSignal<Settings>(DEFAULT_SETTINGS);
+const [moltisStatus, setMoltisStatus] = createSignal<MoltisConnectionStatus>({
+  ok: false,
+  version: null,
+  protocol: null,
+  serverUrl: DEFAULT_SETTINGS.moltisServerUrl,
+  authMode: "none",
+});
 const [showSettings, setShowSettings] = createSignal(false);
 const [isLoading, setIsLoading] = createSignal(true);
+
+function fromApiMoltisStatus(status: ApiMoltisConnectionStatus): MoltisConnectionStatus {
+  return {
+    ok: status.ok,
+    version: status.version ?? null,
+    protocol: status.protocol ?? null,
+    serverUrl: status.server_url,
+    authMode: status.auth_mode,
+    error: status.error,
+  };
+}
+
+export async function refreshMoltisStatus() {
+  try {
+    const status = await getMoltisConnectionStatusApi();
+    setMoltisStatus(fromApiMoltisStatus(status));
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    setMoltisStatus({
+      ok: false,
+      version: null,
+      protocol: null,
+      serverUrl: settings().moltisServerUrl,
+      authMode: settings().moltisApiKey.trim() ? "bearer" : "none",
+      error: message,
+    });
+  }
+}
 
 // Load settings on startup
 export async function loadSettings() {
@@ -307,6 +353,7 @@ export async function loadSettings() {
   try {
     const apiSettings = await getSettingsApi();
     setSettings(fromApiSettings(apiSettings));
+    await refreshMoltisStatus();
   } catch (e) {
     console.error("Failed to load settings:", e);
   } finally {
@@ -344,6 +391,7 @@ export function providerRequiresApiKey(providerId: string): boolean {
 export function useSettings() {
   return {
     settings,
+    moltisStatus,
     setSettings,
     showSettings,
     isLoading,
@@ -399,10 +447,9 @@ export function useSettings() {
       setSettings(newSettings);
       await persistSettings(newSettings);
     },
-    // Always show main UI - API key validation happens at request time
-    // This allows users to explore the app and switch to local providers without being blocked
-    isConfigured: () => true,
+    isConfigured: () => moltisStatus().ok,
     loadSettings,
+    refreshMoltisStatus,
     getModelInfo,
     getDefaultBaseUrl,
     getProviderFromModel,
