@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "check:moltis-only": "bash scripts/check_moltis_only.sh",
+    "check:moltis-smoke": "bash scripts/smoke_moltis_bridge.sh"
   },
   "dependencies": {
     "@solidjs/router": "^0.14.0",
