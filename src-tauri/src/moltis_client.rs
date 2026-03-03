@@ -92,13 +92,17 @@ impl MoltisClient {
         url.set_path("/health");
         url.set_query(None);
         url.set_fragment(None);
-        let response = self
-            .http
-            .get(url.as_str())
-            .timeout(self.cfg.timeout)
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut request = self.http.get(url.as_str()).timeout(self.cfg.timeout);
+        if let Some(key) = self
+            .cfg
+            .api_key
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await?.error_for_status()?;
         Ok(response.json::<Value>().await?)
     }
 
@@ -324,7 +328,7 @@ impl MoltisClient {
         >,
     ) -> Result<Value, MoltisClientError> {
         let connect_id = format!("connect-{}", uuid::Uuid::new_v4());
-        let params = json!({
+        let mut params = json!({
             "minProtocol": self.cfg.min_protocol,
             "maxProtocol": self.cfg.max_protocol,
             "client": {
@@ -334,6 +338,17 @@ impl MoltisClient {
                 "mode": "operator"
             }
         });
+        if let Some(key) = self
+            .cfg
+            .api_key
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            // Compatibility mode: keep explicit connect auth for deployments that
+            // validate auth inside RPC connect payload.
+            params["auth"] = json!({ "api_key": key });
+        }
 
         self.send_json(
             socket,
