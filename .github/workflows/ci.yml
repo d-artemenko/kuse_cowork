@@ -27,6 +27,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Enforce Moltis-only boundary
+        run: npm run check:moltis-only
+
   rust-check:
     runs-on: ubuntu-latest
     steps:
@@ -47,3 +50,6 @@ jobs:
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy -- -D warnings
+
+      - name: Runtime harness regressions
+        run: bash scripts/check_moltis_runtime_harness.sh
